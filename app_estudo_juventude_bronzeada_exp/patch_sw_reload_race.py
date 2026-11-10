@@ -155,9 +155,8 @@ MAX_RELOAD_RETRIES = 2
 # vai direto pra la levando o #seq= junto; se o app demorar demais pra abrir,
 # aparece um aviso com o link. Vazio = parte 6 desligada (volta ao
 # comportamento antigo das partes 3/5).
-# Juventude Bronzeada: preencher com a URL da copia no Posit Connect Cloud depois do primeiro deploy
-# (formato https://<appId>.share.connect.posit.cloud/). Vazio = sem plano B (o patch continua valendo, so nao redireciona).
-FALLBACK_URL = ""
+# Juventude Bronzeada: copia no Posit Connect Cloud (plano B para iPhone/Safari)
+FALLBACK_URL = "https://01a1c5da-5084-37db-0e19-75c3a7c5a85c.share.connect.posit.cloud/"
 FALLBACK_AFTER_SECONDS = 25
 
 PATCH_SCRIPT = """<script>
