@@ -1,0 +1,1909 @@
+library(shiny)
+library(bslib)
+library(shinyjs)
+ 
+# ==============================================================================
+# 1. LEITURA DE DADOS E CONFIGURAÇÕES GERAIS
+# ==============================================================================
+
+caminho_levadas <- "www/levadas.csv"
+caminho_convencoes <- "www/convencoes.csv"
+
+limpar_nome_imagem <- function(texto) {
+  if (is.null(texto) || is.na(texto) || trimws(texto) == "") return("")
+  
+  # Remove acentos manualmente de forma compatível entre Windows/Mac/Linux
+  texto_sem_acento <- chartr(
+    "áàãâéêíóôõúüçÁÀÃÂÉÊÍÓÔÕÚÜÇ", 
+    "aaaaeeiooouucAAAAEEIOOOUUC", 
+    texto
+  )
+  
+  # Converte para minúsculas e troca espaços por underline
+  texto_limpo <- tolower(trimws(texto_sem_acento))
+  texto_limpo <- gsub("\\s+", "_", texto_limpo)
+  
+  return(texto_limpo)
+}
+
+# ------------------------------------------------------------------------------
+# FONTE DOS DADOS: planilha Google (editável sem novo deploy), com os CSVs de www/ como reserva.
+# Ao abrir, o app baixa as abas "levadas", "convencoes" e "volumes" da planilha abaixo.
+# Se a planilha não responder ou vier com formato inesperado, usa os CSVs do pacote.
+# Para editar: abrir a planilha, alterar e recarregar a página do app.
+# ------------------------------------------------------------------------------
+PLANILHA_ID <- "1gHXIavK-15pUM8VUzYsyopSDydd5K4yt7WPDUfXOnFA"
+PLANILHA_ABAS <- c(levadas = "362173015", convencoes = "397132004", volumes = "79337583")
+fonte_dados <- c(levadas = "csv", convencoes = "csv", volumes = "csv")
+
+ler_aba_planilha <- function(aba, colunas_obrigatorias, min_linhas = 1) {
+  if (!nzchar(PLANILHA_ID)) return(NULL)
+  u <- sprintf("https://docs.google.com/spreadsheets/d/%s/export?format=csv&gid=%s&_=%d", PLANILHA_ID, PLANILHA_ABAS[[aba]], as.integer(Sys.time()))
+  tryCatch({
+    op <- options(timeout = 12); on.exit(options(op), add = TRUE)
+    con <- url(u, encoding = "UTF-8"); on.exit(try(close(con), silent = TRUE), add = TRUE)
+    linhas <- suppressWarnings(readLines(con, warn = FALSE, encoding = "UTF-8"))
+    if (length(linhas) == 0) return(NULL)
+    linhas[1] <- sub("^﻿", "", linhas[1])
+    if (grepl("<html|<!DOCTYPE", linhas[1], ignore.case = TRUE)) return(NULL)   # página de login/erro em vez de CSV
+    df <- read.csv(text = paste(linhas, collapse = "\n"), sep = ",", stringsAsFactors = FALSE, check.names = TRUE, encoding = "UTF-8", colClasses = "character", na.strings = character(0))
+    if (!all(colunas_obrigatorias %in% names(df))) return(NULL)
+    df <- df[nzchar(trimws(df[[1]])), , drop = FALSE]
+    if (nrow(df) < min_linhas) return(NULL)
+    rownames(df) <- NULL
+    df
+  }, error = function(e) NULL)
+}
+
+# Tudo o que depende dos dados fica neste bloco, que roda ao iniciar e de novo a cada abertura da página
+# (no Connect Cloud o processo R fica vivo entre visitas; sem isso a planilha só seria relida quando o servidor reiniciasse).
+# Se uma releitura falhar, o app continua com os últimos dados bons.
+ambiente_app <- environment()
+bloco_dados <- quote({
+.nv <- ler_aba_planilha("levadas", c("Levada", "Instrumento", "Compasso_1"))
+if (!is.null(.nv)) { df_levadas <- .nv; fonte_dados[["levadas"]] <- "planilha" } else if (!exists("df_levadas")) df_levadas <- read.csv(caminho_levadas, sep = ";", stringsAsFactors = FALSE)
+.nv <- ler_aba_planilha("convencoes", c("Convencao", "Instrumento", "Compasso_1"))
+if (!is.null(.nv)) { df_convencoes <- .nv; fonte_dados[["convencoes"]] <- "planilha" } else if (!exists("df_convencoes")) df_convencoes <- read.csv(caminho_convencoes, sep = ";", stringsAsFactors = FALSE)
+
+# Mixagem por levada/convenção (aba "volumes": Padrao;Instrumento;Volume;Reverb, escala 0-100 como no mixer de referência).
+# Padrão/instrumento ausentes na tabela mantêm o volume de sempre. Reverb (0-100) alimenta o efeito de reverberação no navegador.
+.nv <- ler_aba_planilha("volumes", c("Padrao", "Instrumento", "Volume"), min_linhas = 0)
+if (!is.null(.nv)) { df_volumes <- .nv; fonte_dados[["volumes"]] <- "planilha" } else if (!exists("df_volumes")) df_volumes <- tryCatch(read.csv("www/volumes.csv", sep = ";", stringsAsFactors = FALSE), error = function(e) NULL)
+message("Fonte dos dados: ", paste(names(fonte_dados), fonte_dados, sep = "=", collapse = ", "))
+vol_tabela <- function(padrao, inst, coluna = "Volume") {
+  if (is.null(df_volumes) || !nzchar(padrao) || !(coluna %in% names(df_volumes))) return(NA_real_)
+  v <- df_volumes[[coluna]][df_volumes$Padrao == padrao & df_volumes$Instrumento == inst]
+  v <- suppressWarnings(as.numeric(sub(",", ".", as.character(v), fixed = TRUE)))
+  if (length(v) == 0 || is.na(v[1])) return(NA_real_)
+  max(0, v[1]) / 100
+}
+
+dict_variada <- c(
+  "PeTaLa" = "pe ta la", "Pe" = "pe -- -- --", "PeLe" = "pe -- le --",
+  "PeTeLeCo" = "pe te le co", "Pe----Co" = "pe -- -- co", "TeLeCo" = "-- te le co",
+  "PeTeLe--" = "pe te le --", "Pe--LeCo" = "pe -- le co", "PeTe--Co" = "pe te -- co", "Pausa" = "-- -- -- --"
+)
+
+levadas_disponiveis <- unique(c(df_levadas$Levada, "Variada"))
+convencoes_disponiveis <- unique(df_convencoes$Convencao)
+instrumentos_disponiveis <- unique(c(df_levadas$Instrumento, df_convencoes$Instrumento))
+# Ordem dos instrumentos da Juventude Bronzeada (o que não estiver na lista vai para o fim)
+ordem_instrumentos <- c("Fundo 1", "Fundo 2", "Dobra", "Agogô", "Xequerê", "Caixa", "Repique", "Timbau")
+instrumentos_disponiveis <- c(intersect(ordem_instrumentos, instrumentos_disponiveis), setdiff(instrumentos_disponiveis, ordem_instrumentos))
+
+# Valor padrão quando NULL/vazio/NA (usado nas opções avançadas dos passos da sequência)
+nz <- function(x, d) if (is.null(x) || length(x) == 0 || is.na(x[1])) d else x
+# Opções "levada/convenção por instrumento" (Avançado do passo): prefixo L: ou C: no valor
+.lev_ov <- setdiff(levadas_disponiveis, "Variada")
+choices_override <- list(
+  "Mesma do passo" = "",
+  "Levadas" = setNames(paste0("L:", .lev_ov), .lev_ov),
+  "Convenções" = setNames(paste0("C:", convencoes_disponiveis), convencoes_disponiveis)
+)
+
+todos_padroes <- unique(c(levadas_disponiveis, convencoes_disponiveis))
+# Acha o arquivo de imagem do sinal (tolera "Forró 1" -> forro1.png ou forro_1.png)
+# Variadas sem sinal de mão: usam a partitura (arquivo com nome diferente do padrão)
+imagens_alias <- c("Pe--LeCo" = "peleco", "PeTe--Co" = "peteco", "PeTeLe--" = "petele", "Pe----Co" = "pe_co", "PeTaLa" = "petala")
+
+arquivo_imagem <- function(nome) {
+  if (nome == "Pausa") return("")
+  if (nome %in% names(imagens_alias)) return(paste0(imagens_alias[[nome]], ".png"))
+  base <- limpar_nome_imagem(nome)
+  candidatos <- unique(c(base, gsub("_([0-9])", "\\1", base)))
+  for (cand in candidatos) {
+    if (file.exists(file.path("www", paste0(cand, ".png")))) return(paste0(cand, ".png"))
+  }
+  return(paste0(base, ".png"))
+}
+map_imagens <- sapply(todos_padroes, arquivo_imagem, USE.NAMES = TRUE)
+
+# Miniatura do sinal ao lado do nome (listas de levadas e convenções)
+rotulo_com_icone <- function(nome) {
+  arq <- if (nome %in% names(map_imagens)) map_imagens[[nome]] else ""
+  tem <- nzchar(arq) && file.exists(file.path("www", "ico", arq))
+  caixa <- if (tem) tags$img(src = paste0("ico/", arq), alt = "",
+                             style = "max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px;")
+           else NULL
+  # nome à esquerda, miniatura alinhada à direita
+  tags$span(class = "rotulo-sinal",
+            tags$span(nome),
+            tags$span(style = "display: inline-flex; align-items: center; justify-content: center; width: 64px; height: 40px; flex-shrink: 0;", caixa))
+}
+
+arquivos_wav <- sapply(instrumentos_disponiveis, function(nome) {
+  nome_limpo <- tolower(nome)
+  nome_limpo <- chartr("áàâãäéèêëíìîïóòôõöúùûüç", "aaaaaeeeeiiiiooooouuuuc", nome_limpo)
+  nome_limpo <- iconv(nome_limpo, to = "ASCII//TRANSLIT")
+  nome_limpo <- gsub("['\"~^`´]", "", nome_limpo)
+  nome_limpo <- gsub("\\s+", "_", trimws(nome_limpo))
+  nome_limpo <- gsub("[^a-z0-9_]", "", nome_limpo)
+  return(paste0(nome_limpo, ".wav"))
+})
+map_wav_js <- paste0("{", paste(sprintf("'%s': '%s'", instrumentos_disponiveis, arquivos_wav), collapse = ", "), "}")
+})   # fim do bloco_dados
+eval(bloco_dados, ambiente_app)
+ultima_carga <- Sys.time()
+recarregar_dados <- function() {
+  if (as.numeric(difftime(Sys.time(), ultima_carga, units = "secs")) < 20) return(invisible(FALSE))
+  ultima_carga <<- Sys.time()
+  try(eval(bloco_dados, ambiente_app), silent = TRUE)
+  invisible(TRUE)
+}
+
+# ==============================================================================
+# 2. INTERFACE DO USUÁRIO (UI)
+# ==============================================================================
+# Versão (hash do conteúdo) do robô 3D, para o navegador não usar uma cópia antiga em cache
+versao_robo <- tryCatch({ h <- unname(tools::md5sum("www/robo3d.js")); if (is.na(h)) "1" else substr(h, 1, 8) }, error = function(e) "1")
+
+ui <- function(req) {
+  recarregar_dados()
+  page_sidebar(
+  title = div(style = "color: white; font-weight: 900; font-style: italic; letter-spacing: -1px;", "JUVENTUDE BRONZEADA"),
+  window_title = "Estudo Juventude Bronzeada",
+  theme = bs_theme(version = 5, primary = "#D25577", "font-sans-serif" = "system-ui, -apple-system, sans-serif"),
+  useShinyjs(),
+  tags$meta(name = "fonte-dados", content = paste(names(fonte_dados), fonte_dados, sep = "=", collapse = ",")),
+  
+  tags$head(
+    tags$meta(name = "viewport", content = "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"),
+    tags$script(src = "three.min.js"),
+    tags$script(src = paste0("robo3d.js?v=", versao_robo)),
+    tags$style(HTML("
+      body, .bslib-page-sidebar, .bslib-sidebar-layout > .main { background-color: #2F2F31 !important; }
+      .navbar { background-color: #D25577 !important; border-bottom: none; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
+      .collapse-toggle { color: #2F2F31 !important; opacity: 1 !important; background-color: #F2C744 !important; border-radius: 50% !important; box-shadow: 0 2px 8px rgba(0,0,0,0.35) !important; }
+      .collapse-toggle:hover { background-color: #FFD966 !important; }
+      .sidebar { background-color: #FBF8EC !important; border-right: none !important; box-shadow: 2px 0 10px rgba(0,0,0,0.2); }
+      .sidebar label, .sidebar h1, .sidebar h2, .sidebar h3, .sidebar h4, .sidebar h5, .sidebar h6 { color: #2F2F31 !important; font-weight: bold; }
+      .sidebar .accordion-button { color: #2F2F31 !important; font-weight: bold; }
+      .sidebar .accordion-button:not(.collapsed) { background-color: #FBE3EA !important; color: #D25577 !important; }
+      .sidebar .accordion-item, .sidebar .accordion-button.collapsed { background-color: #FBF8EC !important; }
+      .card { background-color: #F6F1DC !important; border: none; box-shadow: 0 10px 25px rgba(0,0,0,0.3); border-radius: 16px; margin: 10px;}
+      .btn-primary { background-color: #F2C744 !important; border-color: #F2C744 !important; color: #2F2F31 !important; }
+      .btn-primary:hover { background-color: #E0B52F !important; }
+      .btn-container { display: flex; width: 100%; margin-bottom: 10px;}
+      .btn-container > button { flex: 1; font-weight: bold; min-height: 44px; touch-action: manipulation; }
+      .btn-modo-tab { background-color: rgba(255,255,255,0.15); color: white; border: 2px solid white; font-weight: bold; padding: 10px 22px; border-radius: 30px; }
+      .btn-modo-tab.btn-modo-ativo { background-color: #F2C744; border-color: #F2C744; color: #2F2F31; }
+      
+      /* Listas de levadas/convenções: checkbox | nome ........ miniatura do sinal */
+      #levadas_ativas .checkbox label, #conv_ativas .checkbox label { display: flex; align-items: center; width: 100%; }
+      #levadas_ativas .checkbox label input, #conv_ativas .checkbox label input { flex-shrink: 0; margin-right: 8px; }
+      #levadas_ativas .checkbox label > span, #conv_ativas .checkbox label > span { flex: 1 1 auto; min-width: 0; display: block; }
+      .rotulo-sinal { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex: 1 1 auto; min-width: 0; }
+      .painel-condutor { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: stretch; gap: 10px; width: 100%; margin-bottom: 10px; min-height: 170px; }
+      .box-atual { border: 2px solid #bdc3c7; border-radius: 12px; padding: 10px; flex: 1 1 20%; min-width: 150px; height: 190px; min-height: 190px; max-height: 190px; overflow: hidden; background: #f8f9fa; display: flex; flex-direction: column; align-items: center; justify-content: center; box-shadow: inset 0 0 10px rgba(0,0,0,0.05); transition: opacity 0.3s ease; }
+      .box-proximo { border: 4px solid #D25577; border-radius: 12px; padding: 10px; flex: 1 1 35%; min-width: 250px; height: 190px; min-height: 190px; max-height: 190px; background: white; box-shadow: 0 8px 20px rgba(210,85,119,0.15); display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; overflow: hidden; transition: box-shadow 0.3s ease; }
+      .box-contagem { border: 4px solid #2F2F31; border-radius: 12px; padding: 15px; flex: 1 1 35%; min-width: 250px; background: white; box-shadow: 0 8px 20px rgba(47,47,49,0.15); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+      
+      .contador-numero { font-size: clamp(2.2rem, 4vw, 3.5rem); font-weight: 900; color: #2F2F31; line-height: 1; text-shadow: 2px 2px 5px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; height: auto; }
+      .texto-desfoque { opacity: 0.25; filter: grayscale(100%); }
+      @keyframes blinker { 0% { opacity: 1; } 50% { opacity: 0.2; } 100% { opacity: 1; } }
+      .piscar { animation: blinker 1s linear infinite; }
+      
+      #texto_peteleco { font-size: clamp(14px, 1.8vw, 24px); font-family: monospace; font-weight: bold; color: #2c3e50; line-height: 1.3; text-align: center; padding: 0; margin: 0; min-height: 6.3em; display: flex; flex-direction: column; justify-content: center; align-items: center; }
+      #status_texto { min-height: 58px; display: flex; align-items: center; }
+      html, .bslib-sidebar-layout > .main { scrollbar-gutter: stable; }
+      .span-tempo { transition: color 0.1s ease-in-out; display: inline-block; border-radius: 4px; }
+      .acomp-panel { margin-top: 15px; padding: 12px; border-left: 4px solid #D25577; background-color: #fcfcfc; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+      @media (min-width: 769px) {
+        .card > .card-body { width: 100%; max-width: 900px; box-sizing: border-box; }
+        #status_texto { flex: 1 1 0; min-width: 0; }
+        #cabecalho_livre > div:first-child > div { flex: 0 0 auto; white-space: nowrap; }
+        /* Desktop: o robô vira uma coluna alta à esquerda (ocupa as duas linhas) e as caixas ficam espremidas ao lado, sem aumentar a altura total */
+        .painel-condutor { display: grid !important; grid-template-columns: 250px minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: 190px 212px; gap: 8px 15px; align-items: stretch; }
+        .linha-superior, .linha-inferior { display: contents !important; }
+        .linha-superior > .box-atual { grid-column: 2; grid-row: 1; width: auto !important; min-width: 0 !important; box-sizing: border-box; overflow: hidden; }
+        .linha-superior > .box-proximo { grid-column: 3; grid-row: 1; width: auto !important; min-width: 0 !important; box-sizing: border-box; overflow: hidden; }
+        .linha-inferior > .box-contagem { grid-column: 2 / 4; grid-row: 2; height: auto; min-width: 0 !important; box-sizing: border-box; }
+        #robo_maestro { grid-column: 1; grid-row: 1 / 3; width: auto; min-width: 0 !important; box-sizing: border-box; }
+      }
+
+      @media (max-width: 768px) {
+        .card-body { width: 100% !important; max-width: 100%; box-sizing: border-box; }
+        .main { overflow-anchor: none; }
+        .painel-condutor { flex-direction: column; }
+        .linha-superior, .linha-inferior { flex-direction: column; }
+        .box-atual, .box-proximo, .box-contagem { width: 100% !important; min-width: 0; min-height: 220px; }
+        .box-atual, .box-proximo { height: 220px; max-height: 220px; }
+        #robo_maestro { align-self: center; width: auto; }
+        .contador-numero { height: 120px; font-size: clamp(5rem, 15vw, 6rem) !important; }
+        #cabecalho_livre { flex-wrap: wrap; justify-content: center !important; gap: 10px; text-align: center; }
+        #cabecalho_livre > div { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px !important; }
+        #cabecalho_livre .btn { margin-right: 0 !important; }
+        #cabecalho_sequencia > div[style*='justify-content: center'] { flex-wrap: wrap; }
+      }
+    ")),
+    
+    # ==========================================================================
+    # MOTOR JAVASCRIPT
+    # ==========================================================================
+    tags$script(HTML(paste0("
+      window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      window.masterGain = window.audioCtx.createGain();
+      window.masterGain.connect(window.audioCtx.destination);
+
+      $(document).on('click', '#btn_play', function() {
+          if (window.audioCtx && window.audioCtx.state === 'suspended') window.audioCtx.resume();
+      });
+
+      // Reverb (send por nota, valores do volumes.csv). Convolver com resposta sintetica de ruido decaindo.
+      window.reverbGanho = 5.0; window.wetAtual = 0;
+      window.reverbIn = function() {
+        if (!window._rv || window._rv.dest !== window.masterGain) {
+          if (!window._rvIR) {
+            const ctx = window.audioCtx; const len = Math.floor(ctx.sampleRate * 1.8);
+            const ir = ctx.createBuffer(2, len, ctx.sampleRate);
+            for (let c = 0; c < 2; c++) {
+              const d = ir.getChannelData(c); let e = 0;
+              for (let i = 0; i < len; i++) { d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3); e += d[i] * d[i]; }
+              const norm = 1 / Math.sqrt(e); for (let i = 0; i < len; i++) d[i] *= norm;
+            }
+            window._rvIR = ir;
+          }
+          const conv = window.audioCtx.createConvolver(); conv.buffer = window._rvIR; conv.connect(window.masterGain);
+          window._rv = { conv: conv, dest: window.masterGain };
+        }
+        return window._rv.conv;
+      };
+      window.saida = function(node) {
+        node.connect(window.masterGain);
+        if (window.wetAtual > 0) {
+          const s = window.audioCtx.createGain(); s.gain.value = window.wetAtual;
+          node.connect(s); s.connect(window.reverbIn());
+        }
+      };
+
+      window.measureQueue = [];
+      window.isPlaying = false;
+      window.audioQueueTime = 0;
+      window.schedulerTimer = null;
+      window.metadeAtiva = 1;
+
+      window.sampleBuffers = {};
+      window.wavMap = ", map_wav_js, ";
+
+      window.playSample = function(buffer, time, vol, isSeca, isGrave) {
+        const source = window.audioCtx.createBufferSource();
+        source.buffer = buffer;
+        const gainNode = window.audioCtx.createGain();
+        gainNode.gain.setValueAtTime(vol, time);
+
+        if (isSeca) {
+          // Nota fechada/abafada: em vez de so cortar o som na marra (o que soa
+          // como um clique), simula o abafamento de verdade - um filtro passa-baixa
+          // que fecha rapido (tira o brilho/ressonancia, como uma mao abafando o
+          // couro) junto com uma queda de volume um pouco mais suave.
+          const filtro = window.audioCtx.createBiquadFilter();
+          filtro.type = 'lowpass';
+          filtro.Q.value = 0.7;
+          let freqAberta = 10000;
+          let freqFechada = isGrave ? 300 : 900;
+          let tempoFiltro = isGrave ? 0.05 : 0.025;
+          filtro.frequency.setValueAtTime(freqAberta, time);
+          filtro.frequency.exponentialRampToValueAtTime(freqFechada, time + tempoFiltro);
+
+          let rampAte = isGrave ? 0.16 : 0.08;
+          let paraEm = isGrave ? 0.2 : 0.1;
+          gainNode.gain.setValueAtTime(vol, time);
+          gainNode.gain.exponentialRampToValueAtTime(0.001, time + rampAte);
+
+          source.connect(filtro);
+          filtro.connect(gainNode);
+          window.saida(gainNode);
+          source.start(time);
+          source.stop(time + paraEm);
+        } else {
+          source.connect(gainNode);
+          window.saida(gainNode);
+          source.start(time);
+        }
+      };
+
+      window.preloadSamples = function() {
+        for (let inst in window.wavMap) {
+          fetch(window.wavMap[inst])
+            .then(r => { if(r.ok) return r.arrayBuffer(); throw new Error('Falha no fetch'); })
+            .then(ab => window.audioCtx.decodeAudioData(ab))
+            .then(buf => { window.sampleBuffers[inst] = buf; })
+            .catch(e => console.log('WAV ignorado ou falhou: ' + window.wavMap[inst]));
+        }
+      };
+      window.preloadSamples();
+      window.instFora = function(m, inst) { return !!(m && m.fora && m.fora.indexOf(inst) !== -1); };
+
+      // ==========================================================================
+      // SEQUENCIAS PROGRAMADAS (link com a sequencia embutida na URL)
+      // ==========================================================================
+      window.sequenciaModo = false;
+
+      window.codificarSequencia = function(obj) {
+        var json = JSON.stringify(obj);
+        var b64 = btoa(unescape(encodeURIComponent(json)));
+        return b64.replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+      };
+
+      window.decodificarSequencia = function(str) {
+        var b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        var json = decodeURIComponent(escape(atob(b64)));
+        return JSON.parse(json);
+      };
+
+
+      // Formato compacto: prefixo 'z' + deflate-raw + base64url (links antigos, sem prefixo, continuam validos)
+      window.bytesParaB64url = function(bytes) {
+        var s = '';
+        for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        return btoa(s).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+      };
+      window.b64urlParaBytes = function(str) {
+        var b64 = str.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        var s = atob(b64);
+        var bytes = new Uint8Array(s.length);
+        for (var i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+        return bytes;
+      };
+      window.comprimirSequencia = async function(obj) {
+        var antigo = window.codificarSequencia(obj);
+        try {
+          if (typeof CompressionStream === 'undefined') return antigo;
+          var bytes = new TextEncoder().encode(JSON.stringify(obj));
+          var cs = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+          var buf = await new Response(cs).arrayBuffer();
+          var novo = 'z' + window.bytesParaB64url(new Uint8Array(buf));
+          return novo.length < antigo.length ? novo : antigo;
+        } catch (e) { return antigo; }
+      };
+      window.descomprimirSequencia = async function(str) {
+        if (str.charAt(0) !== 'z') return window.decodificarSequencia(str);
+        var bytes = window.b64urlParaBytes(str.substring(1));
+        var ds = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        var txt = await new Response(ds).text();
+        return JSON.parse(txt);
+      };
+
+      Shiny.addCustomMessageHandler('gerarLinkSequencia', async function(seqObj) {
+        var codigo = await window.comprimirSequencia(seqObj);
+        var base = window.top.location.origin + window.top.location.pathname;
+        var url = base + '#seq=' + codigo;
+        var qr = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(url);
+        Shiny.setInputValue('link_sequencia_gerado', {url: url, qr: qr}, {priority: 'event'});
+      });
+
+      async function verificarSequenciaNaURL() {
+        var hash = window.top.location.hash;
+        if (hash && hash.indexOf('#seq=') === 0) {
+          try {
+            var codigo = hash.substring(5);
+            var seqObj = await window.descomprimirSequencia(codigo);
+            window.sequenciaModo = true;
+            Shiny.setInputValue('sequencia_da_url', seqObj, {priority: 'event'});
+          } catch (e) {
+            console.log('Link de sequencia invalido: ' + e);
+          }
+        }
+      }
+      $(document).on('shiny:connected', function() { verificarSequenciaNaURL(); });
+
+      function getNoiseBuffer() {
+        if (window.noiseBuffer) return window.noiseBuffer;
+        let bSize = window.audioCtx.sampleRate * 1.0; let b = window.audioCtx.createBuffer(1, bSize, window.audioCtx.sampleRate);
+        let out = b.getChannelData(0); for (let i = 0; i < bSize; i++) { out[i] = Math.random() * 2 - 1; }
+        window.noiseBuffer = b; return b;
+      }
+
+      window.stopPlayback = function() {
+        window.isPlaying = false; window.measureQueue = [];
+        if (window.Robo3D) { try { Robo3D.parar(); } catch(e) {} }
+        if(window.schedulerTimer) clearInterval(window.schedulerTimer);
+        if(window.masterGain) window.masterGain.disconnect();
+        window.masterGain = window.audioCtx.createGain(); window.masterGain.connect(window.audioCtx.destination);
+
+        $('#status_texto').text('Pronto para o ensaio! Escolha as levadas e toque.');
+        $('#nome_padrao_atual').text('-');
+        $('#imagem_sinal_atual').html('<div style=\"height: 55px;\">-</div>');
+        $('#conteudo_contador').html('<div class=\"contador-numero texto-desfoque\">-</div>');
+        $('#box_proximo_container').html('<div style=\"display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; opacity: 0.3;\"><h2 style=\"font-size: 1.8rem; color: #2F2F31; font-weight: 900; margin: 0;\">-</h2></div>');
+        $('#texto_peteleco').html('Nenhum sinal ativo no momento.');
+      }
+
+      function playOscillator(freq, time, dur, vol, type = 'sine') {
+        const osc = window.audioCtx.createOscillator(); const gain = window.audioCtx.createGain();
+        osc.type = type; osc.connect(gain); window.saida(gain);
+        osc.frequency.setValueAtTime(freq, time); gain.gain.setValueAtTime(vol, time);
+        gain.gain.exponentialRampToValueAtTime(0.001, time + dur); osc.start(time); osc.stop(time + dur);
+      }
+
+      function playAcousticDrum(freq, time, dur, vol, isGrave, isAlta, isSeca) {
+        if (isSeca) { dur = 0.03; vol = vol * 0.9; }
+        if (isGrave) {
+          const osc = window.audioCtx.createOscillator(); const gain = window.audioCtx.createGain();
+          osc.type = 'sine'; osc.frequency.setValueAtTime(freq * 1.8, time); osc.frequency.exponentialRampToValueAtTime(freq * 0.6, time + dur);
+          gain.gain.setValueAtTime(vol * 1.8, time); gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
+          osc.connect(gain); window.saida(gain); osc.start(time); osc.stop(time + dur);
+          const noise = window.audioCtx.createBufferSource(); noise.buffer = getNoiseBuffer();
+          const filter = window.audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.setValueAtTime(300, time);
+          const noiseGain = window.audioCtx.createGain(); noiseGain.gain.setValueAtTime(vol * 0.4, time); noiseGain.gain.exponentialRampToValueAtTime(0.01, time + 0.02);
+          noise.connect(filter); filter.connect(noiseGain); window.saida(noiseGain); noise.start(time); noise.stop(time + 0.02);
+        } else {
+          const noise = window.audioCtx.createBufferSource(); noise.buffer = getNoiseBuffer();
+          const filter = window.audioCtx.createBiquadFilter(); filter.type = isAlta ? 'highpass' : 'bandpass'; filter.frequency.setValueAtTime(isAlta ? 1800 : freq * 2, time); filter.Q.value = 3.0;
+          const noiseGain = window.audioCtx.createGain(); noiseGain.gain.setValueAtTime(vol * (isAlta ? 1.6 : 1.0), time); noiseGain.gain.exponentialRampToValueAtTime(0.001, time + (isAlta ? dur * 1.2 : dur));
+          noise.connect(filter); filter.connect(noiseGain); window.saida(noiseGain); noise.start(time); noise.stop(time + dur * 1.2);
+          playOscillator(freq, time, dur * 0.8, vol * 0.6, 'triangle');
+        }
+      }
+
+      // Agogô sintetizado (provisório, até existir www/agogo.wav): minúscula = campana grave, MAIÚSCULA = campana aguda, * = abafada
+      window.playAgogo = function(time, aguda, seca, rulo, vol) {
+        const ctx = window.audioCtx; const f = aguda ? 784 : 587; const dur = seca ? 0.06 : 0.30; const v = 0.20 * vol;
+        const toca = function(t, vv) {
+          const g = ctx.createGain();
+          g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vv), t + 0.004); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+          const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f * 1.5; bp.Q.value = 0.8;
+          [[1, 'square', 1.0], [1.48, 'square', 0.55], [2.76, 'sine', 0.35]].forEach(function(p) {
+            const o = ctx.createOscillator(); const og = ctx.createGain();
+            o.type = p[1]; o.frequency.value = f * p[0]; og.gain.value = p[2];
+            o.connect(og); og.connect(bp); o.start(t); o.stop(t + dur + 0.02);
+          });
+          bp.connect(g); window.saida(g);
+        };
+        if (rulo) { toca(time, v * 0.6); toca(time + 0.035, v * 0.6); toca(time + 0.07, v); } else toca(time, v);
+      };
+
+      // Timbau sintetizado (provisório, até existir www/timbau.wav): minúscula = som aberto, MAIÚSCULA = tapa, * = grave (centro do couro)
+      window.playTimbau = function(time, tapa, grave, rulo, vol) {
+        const ctx = window.audioCtx; const v = 0.55 * vol;
+        const toca = function(t, vv) {
+          const f0 = grave ? 150 : (tapa ? 520 : 330), f1 = grave ? 85 : (tapa ? 430 : 270), dur = grave ? 0.28 : (tapa ? 0.07 : 0.20);
+          const o = ctx.createOscillator(); const g = ctx.createGain(); o.type = 'sine';
+          o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.6);
+          g.gain.setValueAtTime(Math.max(0.0002, vv * (grave ? 1.5 : (tapa ? 0.5 : 0.9))), t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+          o.connect(g); window.saida(g); o.start(t); o.stop(t + dur + 0.02);
+          const n = ctx.createBufferSource(); n.buffer = getNoiseBuffer();
+          const fl = ctx.createBiquadFilter(); fl.type = tapa ? 'highpass' : 'bandpass'; fl.frequency.value = tapa ? 2200 : (grave ? 250 : 900); fl.Q.value = tapa ? 0.7 : 1.5;
+          const ng = ctx.createGain(); const nd = tapa ? 0.06 : 0.025;
+          ng.gain.setValueAtTime(Math.max(0.0002, vv * (tapa ? 1.3 : 0.35)), t); ng.gain.exponentialRampToValueAtTime(0.0001, t + nd);
+          n.connect(fl); fl.connect(ng); window.saida(ng); n.start(t); n.stop(t + nd + 0.01);
+        };
+        if (rulo) { toca(time, v * 0.6); toca(time + 0.035, v * 0.6); toca(time + 0.07, v); } else toca(time, v);
+      };
+
+      function playSyntheticSound(tipo, time, pack, instrumento_str, timbre, isPrincipal) {
+        let ii = instrumento_str ? instrumento_str : 'Caixa';
+        let rv = (window.revMedida && window.revMedida[ii] !== undefined) ? Number(window.revMedida[ii]) : 0;
+        window.wetAtual = rv * window.reverbGanho;
+        try { playSyntheticSoundInterno(tipo, time, pack, instrumento_str, timbre, isPrincipal); }
+        finally { window.wetAtual = 0; }
+      }
+
+      function playSyntheticSoundInterno(tipo, time, pack, instrumento_str, timbre, isPrincipal) {
+        let token = tipo.trim(); if (token === '--' || token === '') return;
+        let cleanToken = token.replace(/[*~]/g, ''); let base = cleanToken.toLowerCase().replace(/[^a-z]/g, '');
+        let isAlta = (cleanToken === cleanToken.toUpperCase() && base !== '');
+        let isRulo = token.includes('~'); let isSeca = token.includes('*');
+        let inst = instrumento_str ? instrumento_str : 'Caixa';
+        let balanceVol = 1.0;
+        if (isPrincipal) {
+            balanceVol = window.volPrincipal !== undefined ? window.volPrincipal : 1.0;
+        } else {
+            if (window.volAcompMap && window.volAcompMap[inst] !== undefined) {
+                balanceVol = window.volAcompMap[inst];
+            } else {
+                balanceVol = 0.75;
+            }
+        }
+        // Mixagem da levada/convencao (volumes.csv): vale para todos, foco e acompanhamentos
+        if (window.volMedida && window.volMedida[inst] !== undefined) balanceVol *= Number(window.volMedida[inst]);
+        let instVol = 1.0; let instLow = inst.toLowerCase();
+
+        // Agogô e Timbau sem gravação (.wav) usam o som sintetizado próprio
+        if (!(timbre === 'Meus Sons (.wav)' && window.sampleBuffers[inst])) {
+          if (instLow.includes('agog')) { if (base !== '') window.playAgogo(time, isAlta, isSeca, isRulo, balanceVol); return; }
+          if (instLow.includes('timba')) { if (base !== '') window.playTimbau(time, isAlta, isSeca, isRulo, balanceVol); return; }
+        }
+
+        let baseFreq = 400;
+        if (instLow.includes('surdo') || instLow.includes('fundo') || instLow.includes('marca')) { baseFreq = 140; instVol = 1.3; }
+        else if (instLow.includes('repique') || instLow.includes('bacurinha')) { baseFreq = 500; instVol = 0.6; }
+        else if (instLow.includes('dobra')) { baseFreq = 250; instVol = 1.1; }
+        else if (instLow.includes('timbal')) { baseFreq = 180; instVol = 1.0; }
+        else if (instLow.includes('caixa')) { baseFreq = 300; instVol = 0.45; }
+        let isGrave = (baseFreq < 200);
+
+        if (timbre === 'Meus Sons (.wav)') {
+            let buffer = window.sampleBuffers[inst];
+            if (buffer) {
+                let volWav = (isAlta ? 1.0 : 0.5) * balanceVol * instVol;
+                if (isRulo) {
+                  window.playSample(buffer, time, volWav*0.7, false, isGrave);
+                  window.playSample(buffer, time+0.035, volWav*0.7, false, isGrave);
+                  window.playSample(buffer, time+0.07, volWav, isSeca, isGrave);
+                }
+                else if (base !== '') { window.playSample(buffer, time, volWav, isSeca, isGrave); }
+                return;
+            } else { timbre = 'Orgânico / Acústico'; }
+        }
+
+        let freq = baseFreq;
+        let dur = isGrave ? 0.16 : 0.08; let vol = (isGrave ? (0.5 * 1.4) : 0.5) * balanceVol * instVol;
+        if (isAlta) { vol = vol * 1.8; dur = dur * 1.3; }
+
+        if (timbre === 'Orgânico / Acústico') {
+            if (isRulo) { playAcousticDrum(freq, time, 0.03, vol*0.6, isGrave, false, false); playAcousticDrum(freq, time+0.035, 0.03, vol*0.7, isGrave, false, false); playAcousticDrum(freq, time+0.07, 0.04, vol, isGrave, isAlta, isSeca); }
+            else { if(base !== '') playAcousticDrum(freq, time, dur, vol, isGrave, isAlta, isSeca); }
+        } else if (timbre === 'Eletrônico / Punch') {
+            let wave = isAlta ? 'sawtooth' : (isGrave ? 'square' : 'triangle'); if (isSeca) dur = 0.02;
+            if (isRulo) { playOscillator(freq, time, 0.02, vol*0.7, wave); playOscillator(freq, time+0.035, 0.02, vol*0.7, wave); playOscillator(freq, time+0.07, 0.03, vol, wave); }
+            else { if(base !== '') playOscillator(freq, time, dur, vol * 1.2, wave); }
+        } else {
+            let type = isGrave ? 'triangle' : 'sine'; if (isAlta) type = 'square'; if (isSeca) dur = 0.02;
+            if (isRulo) { playOscillator(freq, time, 0.02, vol*0.7, 'square'); playOscillator(freq, time+0.035, 0.02, vol*0.7, 'square'); playOscillator(freq, time+0.07, 0.03, vol, 'square'); }
+            else { if(base !== '') playOscillator(freq, time, dur, vol, type); }
+        }
+      }
+
+      function formatPetelecoLine(linha_str, offset) {
+        if (!linha_str) return '';
+        let html = []; 
+        let tempos = linha_str.split('|');
+        
+        for (let i = 0; i < tempos.length; i++) {
+            let parts = tempos[i].trim().split(/\\s+/); 
+            for (let j = 0; j < parts.length; j++) {
+                
+                if (parts[j] === '--') {
+                    if (j === 0) {
+                        parts[j] = '<span style=\"display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; color: #bdc3c7;\">(pe)</span>';
+                    } else {
+                        parts[j] = '<span style=\"display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; visibility: hidden;\">--</span>';
+                    }
+                    continue;
+                }
+                
+                let sub_parts = parts[j].split('.'); let fmt_sub = [];
+                for(let k=0; k<sub_parts.length; k++) {
+                    let sp = sub_parts[k]; let isSeca = sp.includes('*'); let clean = sp.replace('*', '');
+                    let txt = clean.toLowerCase();
+                    if (clean.includes('~')) txt = '<i>' + clean.replace('~','').toUpperCase() + '</i>';
+                    else if (/[A-Z]/.test(clean) && clean === clean.toUpperCase()) txt = '<b>' + clean + '</b>';
+                    if(isSeca) txt += '*'; fmt_sub.push(txt);
+                }
+                // Usando inline-flex com altura fixa e centralização vertical para travar o eixo y
+                parts[j] = '<span style=\"display: inline-flex; align-items: center; justify-content: center; padding: 0 6px; height: 1.5em;\">' + fmt_sub.join('.') + '</span>';
+            }
+            
+            html.push(\"<span id='span-tempo-\" + (i + 1 + offset) + \"' class='span-tempo' style='display: inline-flex; align-items: center; justify-content: center; flex: 1; padding: 4px 0;'>\" + parts.join(' ') + \"</span>\");
+        }
+        
+        return \"<div style='display: flex; justify-content: space-around; align-items: center; width: 100%; height: 100%;'><span style='color: #bdc3c7; font-weight: bold; margin-right: 8px;'>|</span> \" + html.join(\" \") + \" <span style='color: #bdc3c7; font-weight: bold; margin-left: 8px;'>|</span></div>\";
+      }
+
+      function ajustarLarguraLeitura() {
+        let container = document.getElementById('texto_peteleco');
+        if (!container) return;
+        let containerWidth = container.clientWidth;
+        if (containerWidth <= 0) return;
+        let linhas = container.children;
+        for (let i = 0; i < linhas.length; i++) {
+            let linha = linhas[i];
+            linha.style.transform = '';
+            linha.style.transformOrigin = 'center top';
+            let naturalWidth = linha.scrollWidth;
+            if (naturalWidth > containerWidth) {
+                let ratio = Math.max(0.35, (containerWidth / naturalWidth) * 0.98);
+                linha.style.transform = 'scale(' + ratio + ')';
+            }
+        }
+      }
+
+      Shiny.addCustomMessageHandler(\"startPlayback\", function(payload) {
+          if (window.audioCtx.state === 'suspended') window.audioCtx.resume();
+          window.isPlaying = true;
+          window.bpm = parseFloat(payload.bpm);
+          window.timbre = payload.timbre;
+          window.instPrincipal = payload.instPrincipal; window.isLoop = payload.isLoop;
+          window.measureQueue = payload.batch;
+          // Passo com BPM proprio no inicio da sequencia: a contagem ja usa essa velocidade
+          if (payload.batch && payload.batch[0] && payload.batch[0].bpm) window.bpm = Number(payload.batch[0].bpm);
+          window.metadeAtiva = 1;
+
+          let now = window.audioCtx.currentTime; let beatDur = 60.0 / window.bpm;
+          window.audioQueueTime = now + 0.1;
+
+          for (let i = 0; i < 4; i++) {
+              let beepTime = window.audioQueueTime + (i * beatDur);
+              playOscillator(880, beepTime, 0.05, 0.5, 'sine');
+              let num = i + 1;
+
+              if (i === 3 && window.measureQueue[0] && window.measureQueue[0].nome.toLowerCase() === 'c2') {
+                  Object.keys(window.measureQueue[0].strings).forEach(inst => {
+                      if ((inst === 'Caixa' || inst === 'Repique') && !window.instFora(window.measureQueue[0], inst)) {
+                          let t1 = beepTime + (beatDur * 0.75);
+                          let t2 = beepTime + (beatDur * 0.875);
+                          let isP = (inst === window.instPrincipal);
+                          playSyntheticSound('co', t1, '1', inst, window.timbre, isP);
+                          playSyntheticSound('co', t2, '1', inst, window.timbre, isP);
+                      }
+                  });
+              }
+
+              if (i === 2 && window.measureQueue[0] && window.measureQueue[0].nome.toLowerCase() === 'pagodão') {
+                  Object.keys(window.measureQueue[0].strings).forEach(inst => {
+                      if ((inst === 'Dobra' || inst === 'Fundo 1' || inst === 'Fundo 2') && !window.instFora(window.measureQueue[0], inst)) {
+                          let t1 = beepTime + (beatDur * 0.5);
+                          let isP = (inst === window.instPrincipal);
+                          playSyntheticSound('le', t1, '1', inst, window.timbre, isP);
+                      }
+                  });
+              }
+              if (i === 3 && window.measureQueue[0] && window.measureQueue[0].nome.toLowerCase() === 'pagodão') {
+                  Object.keys(window.measureQueue[0].strings).forEach(inst => {
+                      if ((inst === 'Dobra' || inst === 'Fundo 1' || inst === 'Fundo 2') && !window.instFora(window.measureQueue[0], inst)) {
+                          let t1 = beepTime;
+                          let t2 = beepTime + (beatDur * 0.5);
+                          let isP = (inst === window.instPrincipal);
+                          playSyntheticSound('pe', t1, '1', inst, window.timbre, isP);
+                          playSyntheticSound('le', t2, '1', inst, window.timbre, isP);
+                      }
+                  });
+              }
+
+              setTimeout(() => {
+                  $('#status_texto').text('Atenção, bateria...');
+                  $('#conteudo_contador').html('<div class=\"contador-numero\">' + num + '</div>');
+                  
+                  // ====== PISADA DO ROBÔ NA CONTAGEM INICIAL ====== //
+                  // Alterna os pés a cada número da contagem (1, 2, 3, 4)
+                  if (i === 0) { 
+                      $('#foot-l').css('transform', 'translateX(-15px)');
+                      $('#foot-r').css('transform', 'translateX(15px)');
+                  } else if (i === 1) { 
+                      $('#foot-l').css('transform', 'translateX(15px)');
+                      $('#foot-r').css('transform', 'translateX(15px)');
+                  } else if (i === 2) { 
+                      $('#foot-l').css('transform', 'translateX(-15px)');
+                      $('#foot-r').css('transform', 'translateX(15px)');
+                  } else if (i === 3) { 
+                      $('#foot-l').css('transform', 'translateX(-15px)');
+                      $('#foot-r').css('transform', 'translateX(-15px)');
+                  }
+                  // =============================================== //
+                  if (window.Robo3D) { try { Robo3D.beat('__contagem', i, beatDur * 1000, false, window.instPrincipal || null, []); } catch(e) {} }
+                  
+                  let n = window.measureQueue[0];
+                  let iH = n && n.img ? '<img src=\"' + n.img + '\" style=\"max-height: 55px; max-width: 100%; object-fit: contain;\">' : '<div style=\"height: 55px;\"></div>';
+                  
+                  $('#box_proximo_container').html('<div style=\"opacity:1; display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; height:100%;\"><h6 class=\"piscar\" style=\"color:#D25577; font-weight:bold; margin:0; min-height:40px; display:flex; align-items:center; justify-content:center; line-height:1.2;\">ATENÇÃO BATERIA: PREPARA</h6><h2 style=\"font-size: 1.8rem; color: #2F2F31; font-weight: 900; margin: 2px 0;\">' + (n ? n.nome : '-') + '</h2><div style=\"height: 60px; display: flex; align-items: center; justify-content: center; width: 100%;\">' + iH + '</div></div>');
+              }, Math.max(0, (beepTime - window.audioCtx.currentTime) * 1000));
+          }
+
+          window.audioQueueTime += 4 * beatDur;
+          if (window.schedulerTimer) clearInterval(window.schedulerTimer);
+
+          window.schedulerTimer = setInterval(schedulerLoop, 100);
+      });
+      
+      Shiny.addCustomMessageHandler(\"updateVolume\", function(v) {
+          window.volPrincipal = v.p;
+          window.volAcompMap = v.a;
+      });
+
+
+      Shiny.addCustomMessageHandler(\"appendBatch\", function(batch) { window.measureQueue.push(...batch); });
+
+      function schedulerLoop() {
+          if (!window.isPlaying) return;
+          let now = window.audioCtx.currentTime;
+
+          if (window.audioQueueTime < now) { window.audioQueueTime = now + 0.1; }
+
+          while (window.measureQueue.length > 0 && window.audioQueueTime < now + 1.0) {
+              let m = window.measureQueue.shift();
+              let m_next = window.measureQueue.length > 0 ? window.measureQueue[0] : m;
+
+              scheduleMeasure(m, m_next, window.audioQueueTime);
+
+              let beatDurAtual = 60.0 / (m.bpm ? Number(m.bpm) : window.bpm);
+
+              if (m.fim_sequencia) {
+                  let delayMsFim = Math.max(0, ((window.audioQueueTime + beatDurAtual * 4) - window.audioCtx.currentTime) * 1000);
+                  setTimeout(window.finalizarSequencia, delayMsFim);
+                  window.audioQueueTime += beatDurAtual * 4;
+                  break;
+              }
+
+              window.audioQueueTime += beatDurAtual * 4;
+              window.metadeAtiva = (window.metadeAtiva === 1) ? 2 : 1;
+
+              if (window.measureQueue.length < 8) { Shiny.setInputValue('js_request_batch', Math.random()); }
+          }
+      }
+
+      window.finalizarSequencia = function() {
+          window.isPlaying = false; window.measureQueue = [];
+          if (window.Robo3D) { try { Robo3D.parar(); } catch(e) {} }
+          if (window.schedulerTimer) clearInterval(window.schedulerTimer);
+          if (window.masterGain) window.masterGain.disconnect();
+          window.masterGain = window.audioCtx.createGain(); window.masterGain.connect(window.audioCtx.destination);
+
+          $('#status_texto').text('Sequência concluída! Parabéns!');
+          $('#nome_padrao_atual').text('-');
+          $('#imagem_sinal_atual').html('<div style=\"height: 55px;\">-</div>');
+          $('#conteudo_contador').html('<div class=\"contador-numero texto-desfoque\">-</div>');
+          $('#box_proximo_container').html('<div style=\"display:flex; flex-direction:column; align-items:center; justify-content:center; width:100%; height:100%;\"><h2 style=\"font-size:1.8rem; color:#27ae60; font-weight:900; margin:0;\">CONCLUÍDO!</h2></div>');
+          $('#texto_peteleco').html('Sequência concluída. Toque em Tocar para repetir do início.');
+
+          Shiny.setInputValue('sequencia_terminou', Math.random(), {priority: 'event'});
+      };
+
+      // Batidas de um tempo do compasso para o robô: [[sílaba, fração do tempo], ...] (frações >= 1 = tempo seguinte)
+      function tokensDoBeat(bStr, b, desloc) {
+          let out = []; if (!bStr) return out;
+          let beats = bStr.split('|'); if (!beats[b]) return out;
+          let tks = beats[b].trim().split(/\\s+/).filter(t => t.length > 0);
+          for (let j = 0; j < tks.length; j++) {
+              let tk = tks[j]; let f0 = j / tks.length;
+              if (tk.includes('.')) { let sub = tk.split('.'); for (let k = 0; k < sub.length; k++) out.push([sub[k], desloc + f0 + (k / sub.length) / tks.length]); }
+              else out.push([tk, desloc + f0]);
+          }
+          return out;
+      }
+      function batidasRobo(m, m_next, i) {
+          let inst = window.instPrincipal; if (!inst || !m || !m.strings) return [];
+          let t = tokensDoBeat(m.strings[inst], i, 0);
+          if (i < 3) t = t.concat(tokensDoBeat(m.strings[inst], i + 1, 1));
+          else if (m_next && m_next.strings) t = t.concat(tokensDoBeat(m_next.strings[inst], 0, 1));
+          return t;
+      }
+      $(document).on('shiny:inputchanged', function(e) {
+          if ((e.name === 'instrumento' || e.name === 'seq_instrumento') && window.Robo3D) { try { Robo3D.setInst(e.value); } catch(x) {} }
+      });
+
+      function scheduleMeasure(m, m_next, startTime) {
+          let beatDur = 60.0 / (m && m.bpm ? Number(m.bpm) : window.bpm); let delayMs = Math.max(0, (startTime - window.audioCtx.currentTime) * 1000);
+          let currentMet = window.metadeAtiva;
+
+          // Metronomo na Pausa: mesmo bipe da contagem inicial, 1 por tempo
+          if (m && typeof m.nome === 'string' && m.nome.toLowerCase() === 'pausa') {
+              for (let mb = 0; mb < 4; mb++) {
+                  playOscillator(880, startTime + (mb * beatDur), 0.05, 0.5, 'sine');
+              }
+          }
+
+          setTimeout(() => {
+              if(!window.isPlaying) return;
+
+              $('#status_texto').text('Tocando...');
+              $('#nome_padrao_atual').text(m.nome);
+              if (m.principal_fora) { $('#nome_padrao_atual').append('<div style=\"font-size:0.75rem; color:#e67e22; font-weight:bold; margin-top:4px;\">Seu instrumento espera neste passo</div>'); }
+              $('#imagem_sinal_atual').html(m.img ? '<img src=\"' + m.img + '\" style=\"max-height: 55px; max-width: 100%; object-fit: contain; filter: grayscale(40%); opacity: 0.9;\">' : '<div style=\"height: 55px;\">-</div>');
+
+              if (window.isLoop) {
+                  $('#conteudo_contador').html('<div class=\"contador-numero texto-desfoque\">∞</div>');
+                  $('#box_proximo_container').html('<div style=\"display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; opacity: 0.3;\"><h2 style=\"font-size: 1.8rem; color: #2F2F31; font-weight: 900; margin: 0;\">MODO LOOP</h2></div>').css('box-shadow', '0 8px 20px rgba(0,0,0,0.05)');
+                              } else {
+                                if (m.restantes === 1) {
+                                  let iH = m.futuro_img ? '<img src=\"'+m.futuro_img+'\" style=\"max-height: 55px; max-width: 100%; object-fit: contain;\">' : '<div style=\"height: 55px;\"></div>';
+                                  
+                                  $('#conteudo_contador').html('<div class=\"contador-numero texto-desfoque\">-</div>');
+                                  $('#box_proximo_container').html('<div style=\"display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%;\"><h6 class=\"piscar\" style=\"color: #D25577; font-weight: bold; margin: 0; min-height: 40px; display: flex; align-items: center; justify-content: center; line-height: 1.2;\">ATENÇÃO BATERIA: PREPARA</h6><h2 style=\"font-size: 1.8rem; color: #2F2F31; font-weight: 900; text-align: center; margin: 2px 0; min-height: 35px;\">' + (m.futuro || '-') + '</h2><div style=\"height: 60px; display: flex; align-items: center; justify-content: center; width: 100%;\">' + iH + '</div></div>').css('box-shadow', '0 8px 30px rgba(210,85,119,0.5)');
+                                } else {
+                                  $('#conteudo_contador').html('<div class=\"contador-numero texto-desfoque\">-</div>');
+                                  $('#box_proximo_container').html('<div style=\"display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; opacity: 0.3;\"><h2 style=\"font-size: 1.8rem; color: #2F2F31; font-weight: 900; margin: 0;\">-</h2><div style=\"position: absolute; color: #bdc3c7; font-weight: bold; font-style: italic; font-size: 1.3rem;\">MANTÉM...</div></div>').css('box-shadow', '0 8px 20px rgba(210,85,119,0.05)');
+                                }
+                              }
+
+              let str1 = (currentMet === 1) ? m.html : m_next.html;
+              let str2 = (currentMet === 1) ? m_next.html : m.html;
+              $('#texto_peteleco').html('<div style=\"margin-bottom: 3px;\">' + formatPetelecoLine(str1, 0) + '</div><div>' + formatPetelecoLine(str2, 4) + '</div>');
+              ajustarLarguraLeitura();
+              // trava a altura da leitura no maior valor já visto, para a tela não 'pular' ao tocar/pausar
+              try { var el = document.getElementById('texto_peteleco'); var h = el.offsetHeight; if (h > (window._minLeit || 0)) { window._minLeit = h; el.style.minHeight = h + 'px'; } } catch(e) {}
+
+          }, delayMs);
+
+          for(let i=0; i<4; i++) {
+              let dM = Math.max(0, (startTime + (i * beatDur) - window.audioCtx.currentTime) * 1000);
+              let cId = (currentMet === 1) ? (i + 1) : (i + 5);
+              
+              setTimeout(() => {
+                  if(!window.isPlaying) return;
+                  
+                  $('.span-tempo').css({'color': '', 'text-shadow': 'none'});
+                  $('#span-tempo-' + cId).css({'color': '#D25577', 'text-shadow': '0px 0px 4px rgba(210,85,119,0.3)'});
+                  
+                  // ====== ANIMAÇÃO DO ROBÔ ====== //
+                  if (window.Robo3D) { try { Robo3D.beat(m.nome, i, beatDur * 1000, (!window.isLoop && m.restantes === 1), window.instPrincipal || null, batidasRobo(m, m_next, i)); } catch(e) {} }
+                  
+                  // 1. A Pisada Lateral (Abre, junta direita, abre, junta esquerda)
+                  if (i === 0) { 
+                      $('#foot-l').css('transform', 'translateX(-15px)');
+                      $('#foot-r').css('transform', 'translateX(15px)');
+                  } else if (i === 1) { 
+                      $('#foot-l').css('transform', 'translateX(15px)');
+                      $('#foot-r').css('transform', 'translateX(15px)');
+                  } else if (i === 2) { 
+                      $('#foot-l').css('transform', 'translateX(-15px)');
+                      $('#foot-r').css('transform', 'translateX(15px)');
+                  } else if (i === 3) { 
+                      $('#foot-l').css('transform', 'translateX(-15px)');
+                      $('#foot-r').css('transform', 'translateX(-15px)');
+                  }
+
+                  // 2. Os Braços e os Olhos
+                  if (!window.isLoop && m.restantes === 1) {
+                      // Modo Alerta (Último compasso): Levanta os braços e pisca vermelho
+                      $('#arm-l').css('transform', 'rotate(130deg)');
+                      $('#arm-r').css('transform', 'rotate(-130deg)');
+                      $('.robo-eye').attr('fill', '#D25577');
+                      $('#robo-led').attr('fill', (i % 2 === 0) ? '#f1c40f' : '#D25577'); 
+                      
+                      let countNum = i + 1;
+                      $('#conteudo_contador').html('<div class=\"contador-numero\" style=\"color: #D25577; text-shadow: 2px 2px 5px rgba(210,85,119,0.2);\">' + countNum + '</div>');
+                  } else {
+                      // Modo Regência normal: balança os braços 
+                      let angleL = (i % 2 === 0) ? -30 : 15;
+                      let angleR = (i % 2 === 0) ? 30 : -15;
+                      
+                      $('#arm-l').css('transform', 'rotate(' + angleL + 'deg)');
+                      $('#arm-r').css('transform', 'rotate(' + angleR + 'deg)');
+                      $('.robo-eye').attr('fill', '#f1c40f');
+                      $('#robo-led').attr('fill', '#bdc3c7');
+                  }
+                  
+              }, dM);
+          }
+
+          window.volMedida = (m && m.vol) ? m.vol : {};
+          window.revMedida = (m && m.rev) ? m.rev : {};
+          for (let inst in m.strings) {
+              let isPrin = (inst === window.instPrincipal); let bStr = m.strings[inst]; if (!bStr) continue;
+              let beats = bStr.split('|');
+              for (let b = 0; b < 4; b++) {
+                  if (!beats[b]) continue;
+                  let tks = beats[b].trim().split(/\\s+/).filter(t => t.length > 0);
+                  if (tks.length === 0) continue;
+                  let tkDur = beatDur / tks.length;
+                  for (let j = 0; j < tks.length; j++) {
+                      let tk = tks[j]; let slot = startTime + (b * beatDur) + (j * tkDur);
+                      if (tk.includes('.')) { let subT = tk.split('.'); let sDur = tkDur / subT.length; for (let k=0; k<subT.length; k++) playSyntheticSound(subT[k], slot + (k*sDur), '1', inst, window.timbre, isPrin); }
+                      else { playSyntheticSound(tk, slot, '1', inst, window.timbre, isPrin); }
+                  }
+              }
+          }
+          window.volMedida = null; window.revMedida = null;
+      }
+    ")))
+  ),
+  
+  sidebar = sidebar(
+    id = "sidebar_principal",
+    width = 340,
+    open = list(desktop = "open", mobile = "closed"),
+    
+    sliderInput("bpm", "Velocidade (BPM):", min = 40, max = 150, value = 80, step = 5),
+    sliderInput("rep_levadas", "Repetições das Levadas (mín - máx):", min = 4, max = 32, value = c(4, 8), step = 2),
+    selectInput("instrumento", "Foco no Instrumento:", choices = instrumentos_disponiveis, selected = "Dobra"),
+    
+    # O parâmetro 'open' força todas as abas listadas a já começarem abertas!
+    accordion(
+      open = c("Levadas", "Convenções", "Acompanhamento", "Mixagem"),
+      
+      accordion_panel("Levadas", 
+                      checkboxGroupInput("levadas_ativas", NULL, choiceNames = lapply(levadas_disponiveis, rotulo_com_icone), choiceValues = levadas_disponiveis, selected = character(0)),
+                      conditionalPanel(
+                        condition = "input.levadas_ativas && input.levadas_ativas.indexOf('Variada') > -1",
+                        div(
+                          style = "margin-top: 10px; padding: 12px; background-color: #FBE3EA; border-left: 4px solid #D25577; border-radius: 4px;",
+                          tags$label("Opções para Variada (Batidas):", style = "font-weight: bold; color: #2F2F31; font-size: 0.95em;"),
+                          checkboxGroupInput("variada_opcoes", label = NULL, choices = names(dict_variada), selected = c("Pe", "PeLe", "PeTaLa", "Pausa"), inline = TRUE)
+                        )
+                      )
+      ),
+      accordion_panel("Convenções", checkboxGroupInput("conv_ativas", NULL, choiceNames = lapply(convencoes_disponiveis, rotulo_com_icone), choiceValues = convencoes_disponiveis, selected = character(0))),
+      accordion_panel("Acompanhamento", 
+                      checkboxGroupInput("acompanhamento_ativo", "Adicionar à banda:", choices = character(0), selected = character(0)),
+                      uiOutput("config_acompanhamento")
+      ),
+      accordion_panel("Mixagem", 
+                      sliderInput("vol_principal", "Volume do Foco:", min = 0, max = 100, value = 100, step = 5, post = "%"),
+                      uiOutput("mixagem_acomp")
+      )
+    )
+  ),
+  
+  div(id = "seletor_modo", style = "display: flex; gap: 10px; justify-content: center; margin-bottom: 8px;",
+      actionButton("ir_modo_livre", "🎵 Ensaio Livre", class = "btn-modo-tab btn-modo-ativo"),
+      actionButton("ir_modo_montar", "🛠️ Montar Sequência", class = "btn-modo-tab")
+  ),
+  div(id = "tela_ensaio_livre", style = "width: 100%;",
+  card(
+    class = "text-center", style = "display: flex; flex-direction: column; align-items: center;",
+    div(
+      id = "cabecalho_livre",
+      style = "display: flex; flex-direction: column; width: 100%; margin-bottom: 8px; padding: 0 10px; gap: 8px;",
+      div(
+        style = "display: flex; justify-content: space-between; align-items: center; width: 100%;",
+        h4(id = "status_texto", "Pronto para o ensaio! Escolha as levadas e toque.", style = "color: #D25577 !important; font-weight: bold; margin: 0;"),
+        div(
+          actionButton("btn_toggle_leitura", " Modo Avançado", icon = icon("eye-slash"), class = "btn-sm btn-outline-secondary", style = "font-weight: bold; border-color: #bdc3c7; margin-right: 8px;"),
+          actionButton("btn_toggle_box_atual", " Ocultar Sinal Atual", icon = icon("eye-slash"), class = "btn-sm btn-outline-secondary", style = "font-weight: bold; border-color: #bdc3c7;")
+        )
+      ),
+      div(class = "btn-container", style = "margin-bottom: 0;", actionButton("btn_play", "Tocar", icon = icon("play-circle"), class = "btn-lg btn-primary", disabled = "TRUE"))
+    ),
+    div(
+      id = "cabecalho_sequencia", style = "display: none; flex-direction: column; align-items: center; width: 100%; margin-bottom: 15px; padding: 10px;",
+      h6("EXERCÍCIO", style = "color: #bdc3c7; font-weight: bold; letter-spacing: 2px; margin: 0 0 4px 0;"),
+      h3(id = "titulo_sequencia_ativa", "-", style = "color: #2F2F31; font-weight: 900; margin: 0 0 14px 0; text-align: center;"),
+      div(
+        style = "display: flex; gap: 8px; justify-content: center; margin-bottom: 10px;",
+        actionButton("btn_toggle_leitura_seq", " Modo Avançado", icon = icon("eye-slash"), class = "btn-sm btn-outline-secondary", style = "font-weight: bold; border-color: #bdc3c7;"),
+        actionButton("btn_toggle_box_atual_seq", " Ocultar Sinal Atual", icon = icon("eye-slash"), class = "btn-sm btn-outline-secondary", style = "font-weight: bold; border-color: #bdc3c7;")
+      ),
+      div(
+        id = "seq_opcoes_extra",
+        style = "display: flex; flex-direction: column; align-items: stretch; gap: 4px; width: 100%; max-width: 360px; margin-bottom: 14px; padding: 12px 16px; background-color: #f8f9fa; border-radius: 10px; border: 1px solid #e0e0e0;",
+        sliderInput("seq_bpm_control", "Velocidade (BPM):", min = 40, max = 150, value = 80, step = 5, width = "100%"),
+        checkboxGroupInput("seq_acompanhamento_ativo", "Tocar junto com:", choices = character(0), selected = character(0), inline = TRUE)
+      ),
+      actionButton("btn_play_seq", "TOCAR", icon = icon("play-circle"), class = "btn-lg btn-primary", style = "font-size: 1.5rem; padding: 14px 40px; font-weight: 900;")
+    ),
+    
+    # 2. Painel Condutor Reorganizado
+    div(
+      class = "painel-condutor",
+      style = "display: flex; flex-direction: column; gap: 8px; width: 100%;",
+      
+      # Linha Superior: Tocando e Próximo
+      div(
+        class = "linha-superior",
+        style = "display: flex; gap: 15px; width: 100%;",
+        div(
+          class = "box-atual", id = "box_atual_container", style = "flex: 1;",
+          h6("TOCANDO", style = "color: #7f8c8d; font-weight: bold; font-size: 0.8rem; margin: 0;"),
+          h3(id = "nome_padrao_atual", "-", style = "font-size: 1.1rem; font-weight: bold; color: #34495e; text-align: center; margin: 8px 0; min-height: 28px;"),
+          tags$div(id = "imagem_sinal_atual", tags$div(style = "height: 55px;", "-"))
+        ),
+        div(
+          class = "box-proximo", id = "box_proximo_container", style = "flex: 1;",
+          tags$div(style = "display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; height: 100%; opacity: 0.3;", tags$h2("-", style = "font-size: 1.8rem; color: #2F2F31; font-weight: 900; margin: 0;"))
+        )
+      ),
+      
+      # Linha Inferior: Robô Maestro (à esquerda) e Caixa de Contagem Quadrada (à direita)
+      div(
+        class = "linha-inferior",
+        style = "display: flex; gap: 15px; width: 100%; align-items: stretch;",
+        
+        # Robô Centralizado
+        div(
+          id = "robo_maestro",
+          style = "background: linear-gradient(180deg, #FBF3D5 0%, #F9D9B8 55%, #EFA9B4 100%); border: 1px solid #E9C9A8; border-radius: 12px; display: flex; justify-content: center; align-items: center; padding: 10px; min-width: 150px;",
+          HTML("
+            <svg width=\"90\" height=\"90\" viewBox=\"0 0 140 150\" xmlns=\"http://www.w3.org/2000/svg\">
+            <style>
+              #arm-l, #arm-r, #foot-l, #foot-r { 
+                transition: transform 0.1s ease-in-out; 
+                transform-box: fill-box;
+              }
+              /* Define o pivô exatamente no topo interno de cada braço (ombro) */
+              #arm-l { transform-origin: 80% 10%; }
+              #arm-r { transform-origin: 20% 10%; }
+            </style>
+            
+            <rect x=\"50\" y=\"110\" width=\"12\" height=\"28\" fill=\"#7f8c8d\" />
+            <rect x=\"78\" y=\"110\" width=\"12\" height=\"28\" fill=\"#7f8c8d\" />
+            
+            <rect id=\"foot-l\" x=\"40\" y=\"135\" width=\"24\" height=\"15\" rx=\"6\" fill=\"#2c3e50\" />
+            <rect id=\"foot-r\" x=\"74\" y=\"135\" width=\"24\" height=\"15\" rx=\"6\" fill=\"#2c3e50\" />
+            
+            <rect id=\"arm-l\" x=\"22\" y=\"58\" width=\"14\" height=\"45\" rx=\"7\" fill=\"#95a5a6\" />
+            
+            <rect id=\"arm-r\" x=\"104\" y=\"58\" width=\"14\" height=\"45\" rx=\"7\" fill=\"#95a5a6\" />
+            
+            <rect x=\"40\" y=\"50\" width=\"60\" height=\"65\" rx=\"10\" fill=\"#34495e\" />
+            <circle id=\"robo-led\" cx=\"70\" cy=\"85\" r=\"8\" fill=\"#bdc3c7\" />
+            
+            <rect id=\"antena-stick\" x=\"67\" y=\"6\" width=\"6\" height=\"10\" fill=\"#7f8c8d\" />
+            <circle id=\"antena-ball\" cx=\"70\" cy=\"6\" r=\"6\" fill=\"#D25577\" />
+            
+            <rect x=\"38\" y=\"15\" width=\"64\" height=\"35\" rx=\"14\" fill=\"#46637d\" />
+            <circle cx=\"55\" cy=\"32\" r=\"8\" fill=\"#ecf0f1\" />
+            <circle cx=\"85\" cy=\"32\" r=\"8\" fill=\"#ecf0f1\" />
+            <circle cx=\"55\" cy=\"32\" r=\"3.5\" fill=\"#2c3e50\" />
+            <circle cx=\"85\" cy=\"32\" r=\"3.5\" fill=\"#2c3e50\" />
+            <rect x=\"55\" y=\"43\" width=\"30\" height=\"5\" rx=\"2.5\" fill=\"#2c3e50\" />
+          </svg>
+          <div id=\"robo3d_palco\" style=\"display:none;\"></div>
+          <script>
+            $(function() {
+              try {
+                var roboTam = function() { return window.matchMedia('(min-width: 769px)').matches ? [230, 390, 1.2] : [200, 250, 1.15]; };
+                var tam0 = roboTam();
+                if (window.Robo3D && Robo3D.init('robo3d_palco', tam0[0], tam0[1])) {
+                  Robo3D.resize(tam0[0], tam0[1], tam0[2]);
+                  $(window).on('resize', function() { try { window._minLeit = 0; var pel = document.getElementById('texto_peteleco'); if (pel) pel.style.minHeight = ''; var t = roboTam(); Robo3D.resize(t[0], t[1], t[2]); } catch(x) {} });
+                  $('#robo_maestro svg').hide();
+                  $('#robo3d_palco').show();
+                  Robo3D.setInst($('#instrumento').val() || 'Dobra');
+                  $(document).on('shiny:connected', function() { try { Robo3D.setInst($('#instrumento').val() || 'Dobra'); } catch(x) {} });
+                }
+              } catch(e) {}
+            });
+          </script>
+          ")
+        ),
+        
+        # Caixa de Contagem (Quadrada e ocupando o resto do espaço ao lado do robô)
+        div(
+          class = "box-contagem",
+          style = "flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; margin: 0; background-color: #f8f9fa; border: 1px solid #e0e0e0; border-radius: 12px; padding: 15px;",
+          h5("CONTAGEM", style = "color: #2F2F31; font-weight: bold; letter-spacing: 2px; margin-bottom: 5px; font-size: 0.9rem;"),
+          tags$div(id = "conteudo_contador", style = "display: flex; align-items: center; justify-content: center; flex: 1;", tags$div(class = "contador-numero texto-desfoque", "-"))
+        )
+      )
+    ),
+    
+    div(
+      id = "box_leitura",
+      style = "background-color: #f8f9fa; padding: 14px 20px; border-radius: 12px; width: 100%; margin-top: 6px; border: 1px solid #e0e0e0; display: flex; flex-direction: column; justify-content: center; box-sizing: border-box;",
+      h5(textOutput("titulo_instrumento"), style = "color: #7f8c8d !important; margin-bottom: 6px; text-align: center; font-size: 1.1rem; font-weight: bold;"),
+      tags$div(id = "texto_peteleco", style = "font-size: clamp(14px, 2.2vw, 26px); width: 100%; display: flex; flex-direction: column; gap: 8px;", "Nenhum sinal ativo no momento.")
+    )
+  )
+  ),
+  div(id = "tela_montar_sequencia", style = "display: none; width: 100%;",
+    card(
+      class = "text-center", style = "min-height: 85vh; padding: 10px 5px;",
+      h3("Montar Sequência", style = "color: #2F2F31; font-weight: 900; margin-bottom: 4px;"),
+      p("Monte um exercício com passos fixos (sem sorteio) e gere um link + QR code pra compartilhar.", style = "color: #7f8c8d; font-size: 0.95em; margin-bottom: 20px;"),
+      
+      div(style = "max-width: 480px; margin: 0 auto; text-align: left;",
+        
+        selectInput("seq_instrumento", "Instrumento:", choices = instrumentos_disponiveis, selected = "Dobra", width = "100%"),
+        radioButtons("seq_bpm_modo", "Velocidade do exercício:",
+                     choices = c("Sugerida (o aluno pode mudar)" = "sugerida", "Fixa (o aluno não pode mudar)" = "fixa", "Sem velocidade predefinida (o aluno escolhe)" = "livre"),
+                     selected = "sugerida", width = "100%"),
+        conditionalPanel(
+          condition = "input.seq_bpm_modo != 'livre'",
+          sliderInput("seq_bpm", "BPM:", min = 40, max = 150, value = 80, step = 5, width = "100%")
+        ),
+        
+        hr(),
+        
+        h5("Adicionar passo", style = "color: #2F2F31; font-weight: bold; margin-bottom: 10px;"),
+        selectInput("seq_tipo_passo", "Tipo de passo:", choices = c("Levada" = "levada", "Convenção" = "convencao"), width = "100%"),
+        conditionalPanel(
+          condition = "input.seq_tipo_passo == 'levada'",
+          selectInput("seq_padrao_levada", "Levada:", choices = setdiff(levadas_disponiveis, "Variada"), width = "100%"),
+          numericInput("seq_compassos_passo", "Nº de compassos:", value = 8, min = 2, max = 32, step = 2, width = "100%")
+        ),
+        conditionalPanel(
+          condition = "input.seq_tipo_passo == 'convencao'",
+          selectInput("seq_padrao_convencao", "Convenção:", choices = convencoes_disponiveis, width = "100%")
+        ),
+        div(style = "margin-top: 4px;",
+            tags$label("Quem toca neste passo:", style = "font-weight: bold; font-size: 0.9em;"),
+            div(style = "display: flex; gap: 6px; margin: 2px 0 4px 0;",
+                actionButton("seq_inst_todos", "Todos", class = "btn-sm btn-outline-secondary"),
+                actionButton("seq_inst_nenhum", "Nenhum", class = "btn-sm btn-outline-secondary")
+            ),
+            checkboxGroupInput("seq_instrumentos_passo", NULL, choices = instrumentos_disponiveis, selected = instrumentos_disponiveis, inline = TRUE)
+        ),
+        numericInput("seq_bpm_passo", "Velocidade a partir deste passo (BPM) — opcional, vazio mantém a anterior:", value = NA, min = 30, max = 240, step = 5, width = "100%"),
+        tags$details(style = "margin: 6px 0 10px 0;",
+          tags$summary("Avançado: começar em outro compasso e levada/entrada por instrumento", style = "cursor: pointer; font-weight: bold; color: #2F2F31; font-size: 0.9em;"),
+          div(style = "padding: 8px; border: 1px solid #eee; border-radius: 6px; margin-top: 6px;",
+            numericInput("seq_inicio_compasso", "Começar a partir do compasso nº (da levada/convenção):", value = 1, min = 1, max = 16, step = 1, width = "100%"),
+            p("Opcional, só para instrumentos marcados em 'Quem toca': outra levada/convenção e/ou entrada mais tarde. Compasso e tempo contam a partir do início deste passo (compasso 1, tempo 1).", style = "color: #7f8c8d; font-size: 0.8em; margin: 0 0 6px 0;"),
+            lapply(seq_along(instrumentos_disponiveis), function(k) {
+              div(style = "margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px dashed #eee;",
+                tags$label(instrumentos_disponiveis[k], style = "font-weight: bold; font-size: 0.85em; margin: 0;"),
+                selectInput(paste0("seq_ov_", k), NULL, choices = choices_override, selected = "", selectize = FALSE, width = "100%"),
+                div(style = "display: flex; gap: 10px; align-items: flex-end;",
+                  div(style = "flex: 1;", numericInput(paste0("seq_oc_", k), "Entra no compasso:", value = 1, min = 1, max = 32, step = 1, width = "100%")),
+                  div(style = "flex: 1;", selectInput(paste0("seq_ob_", k), "no tempo:", choices = c("1", "2", "3", "4"), selected = "1", selectize = FALSE, width = "100%"))
+                )
+              )
+            })
+          )
+        ),
+        div(style = "text-align: center; margin: 10px 0 20px 0;",
+            actionButton("btn_add_passo", "+ Adicionar à sequência", icon = icon("plus"), class = "btn-outline-primary")
+        ),
+        
+        h5("Passos da sequência", style = "color: #2F2F31; font-weight: bold; margin-bottom: 10px;"),
+        uiOutput("lista_passos_sequencia"),
+        
+        hr(),
+        
+        textInput("seq_nome", "Nome do exercício:", placeholder = "Ex.: Aula 3 - Baião e Xote", width = "100%"),
+        div(style = "text-align: center; margin-top: 10px;",
+            actionButton("btn_gerar_link_seq", "Gerar link e QR code", icon = icon("link"), class = "btn-lg btn-primary")
+        ),
+        uiOutput("resultado_link_seq")
+      )
+    )
+  )
+
+)
+}
+
+# ==============================================================================
+# 3. LÓGICA DO SERVIDOR (SERVER) - APENAS GERA OS DADOS
+# ==============================================================================
+server <- function(input, output, session) {
+  
+  observeEvent(input$instrumento, {
+    opcoes_disponiveis <- setdiff(instrumentos_disponiveis, input$instrumento)
+    selecionados_atuais <- intersect(input$acompanhamento_ativo, opcoes_disponiveis)
+    updateCheckboxGroupInput(session, "acompanhamento_ativo", choices = opcoes_disponiveis, selected = selecionados_atuais)
+  })
+  
+  output$config_acompanhamento <- renderUI({
+    req(input$acompanhamento_ativo)
+    l_ativas <- input$levadas_ativas; c_ativas <- input$conv_ativas
+    if (length(l_ativas) == 0 && length(c_ativas) == 0) return(tags$p(style="color: #e74c3c; font-size: 0.9em; margin-top: 15px; text-align: center;", "Selecione primeiro as Levadas ou Convenções acima."))
+    ui_list <- lapply(input$acompanhamento_ativo, function(inst) {
+      id_inst <- gsub(" ", "_", inst)
+      div(
+        class = "acomp-panel",
+        tags$strong(paste("O que a", inst, "toca?"), style = "color: #2F2F31; display: block; margin-bottom: 8px;"),
+        if (length(l_ativas) > 0) checkboxGroupInput(inputId = paste0("acomp_lev_", id_inst), label = "Levadas:", choices = l_ativas, selected = l_ativas, inline = TRUE),
+        if (length(c_ativas) > 0) checkboxGroupInput(inputId = paste0("acomp_conv_", id_inst), label = "Convenções:", choices = c_ativas, selected = c_ativas, inline = TRUE)
+      )
+    })
+    do.call(tagList, ui_list)
+  })
+  
+  output$titulo_instrumento <- renderText({ paste("Leitura -", input$instrumento) })
+  
+  estado <- reactiveValues(
+    rodando = FALSE, exibir_box_atual = TRUE, exibir_leitura = TRUE, veio_de_convencao = TRUE, pula_entrada = FALSE, inst_atual = "*", inst_proximo = "*", nota_forcada = "",
+    fase_atual = "Levada", padrao_atual = "", compassos_restantes = 0, compassos_tocados = 0,
+    proxima_fase = "", proximo_padrao = "", proximos_compassos = 0,
+    modo_sequencia = FALSE, sequencia_passos = list(), sequencia_indice = 1, sequencia_fim = FALSE, sequencia_nome = "",
+    passos_sequencia_editor = list(), sequencia_bpm = NULL, sequencia_instrumento = NULL,
+    inicio_atual = 1, inicio_proximo = 1, ov_atual = list(), ov_proximo = list(), meio_desloc = FALSE,
+    bpm_efetivo = NA_real_, bpm_proximo = NA_real_
+  )
+  
+  bpm_ativo <- function() if (isTRUE(estado$modo_sequencia)) estado$sequencia_bpm else input$bpm
+  instrumento_ativo <- function() if (isTRUE(estado$modo_sequencia)) estado$sequencia_instrumento else input$instrumento
+  
+  observeEvent(input$seq_bpm_control, {
+    req(isTRUE(estado$modo_sequencia))
+    estado$sequencia_bpm <- input$seq_bpm_control
+  })
+  
+  observe({
+    req(input$vol_principal) 
+    if (isTRUE(estado$modo_sequencia)) return()
+    vol_p <- input$vol_principal / 100.0
+    
+    vol_map <- list()
+    if (length(input$acompanhamento_ativo) > 0) {
+      for (inst in input$acompanhamento_ativo) {
+        id_inst <- gsub(" ", "_", inst)
+        val <- input[[paste0("vol_", id_inst)]]
+        vol_map[[inst]] <- if(is.null(val)) 0.75 else (val / 100.0)
+      }
+    }
+    session$sendCustomMessage("updateVolume", list(p = vol_p, a = vol_map))
+  })
+  
+  observe({
+    req(isTRUE(estado$modo_sequencia))
+    vol_map <- list()
+    if (length(input$seq_acompanhamento_ativo) > 0) {
+      for (inst in input$seq_acompanhamento_ativo) {
+        vol_map[[inst]] <- 0.75
+      }
+    }
+    session$sendCustomMessage("updateVolume", list(p = 1.0, a = vol_map))
+  })
+  
+  output$mixagem_acomp <- renderUI({
+    req(input$acompanhamento_ativo)
+    ui_list <- lapply(input$acompanhamento_ativo, function(inst) {
+      id_inst <- gsub(" ", "_", inst)
+      sliderInput(paste0("vol_", id_inst), paste("Volume -", inst, ":"), min = 0, max = 100, value = 75, step = 5, post = "%")
+    })
+    do.call(tagList, ui_list)
+  })
+  
+  toggle_leitura <- function() {
+    estado$exibir_leitura <- !estado$exibir_leitura
+    if (estado$exibir_leitura) {
+      updateActionButton(session, "btn_toggle_leitura", label = " Modo Avançado", icon = icon("eye-slash"))
+      updateActionButton(session, "btn_toggle_leitura_seq", label = " Modo Avançado", icon = icon("eye-slash"))
+      shinyjs::show("box_leitura")
+    } else {
+      updateActionButton(session, "btn_toggle_leitura", label = " Mostrar Leitura", icon = icon("eye"))
+      updateActionButton(session, "btn_toggle_leitura_seq", label = " Mostrar Leitura", icon = icon("eye"))
+      shinyjs::hide("box_leitura")
+    }
+  }
+  
+  toggle_box_atual <- function() {
+    estado$exibir_box_atual <- !estado$exibir_box_atual
+    if (estado$exibir_box_atual) {
+      updateActionButton(session, "btn_toggle_box_atual", label = " Ocultar Sinal Atual", icon = icon("eye-slash"))
+      updateActionButton(session, "btn_toggle_box_atual_seq", label = " Ocultar Sinal Atual", icon = icon("eye-slash"))
+      shinyjs::show("box_atual_container")
+    } else {
+      updateActionButton(session, "btn_toggle_box_atual", label = " Exibir Sinal Atual", icon = icon("eye"))
+      updateActionButton(session, "btn_toggle_box_atual_seq", label = " Exibir Sinal Atual", icon = icon("eye"))
+      shinyjs::hide("box_atual_container")
+    }
+  }
+  
+  observeEvent(input$btn_toggle_leitura, { toggle_leitura() })
+  observeEvent(input$btn_toggle_leitura_seq, { toggle_leitura() })
+  observeEvent(input$btn_toggle_box_atual, { toggle_box_atual() })
+  observeEvent(input$btn_toggle_box_atual_seq, { toggle_box_atual() })
+  
+  observe({
+    if (isTRUE(estado$modo_sequencia)) return()
+    if (length(input$levadas_ativas) > 0 || length(input$conv_ativas) > 0) { shinyjs::enable("btn_play") } 
+    else { shinyjs::disable("btn_play"); if (estado$rodando) reset_tudo() }
+  })
+  
+  reset_tudo <- function() {
+    estado$rodando <- FALSE
+    
+    estado$padrao_atual <- ""
+    estado$proximo_padrao <- ""
+    estado$proxima_fase <- ""
+    estado$compassos_tocados <- 0
+    estado$pula_entrada <- FALSE
+    estado$inicio_atual <- 1; estado$inicio_proximo <- 1; estado$ov_atual <- list(); estado$ov_proximo <- list(); estado$meio_desloc <- FALSE; estado$bpm_efetivo <- NA_real_; estado$bpm_proximo <- NA_real_
+    estado$inst_atual <- "*"; estado$inst_proximo <- "*"
+    estado$nota_forcada <- ""
+    estado$sequencia_indice <- 1
+    estado$sequencia_fim <- FALSE
+    
+    shinyjs::runjs("stopPlayback();")
+    id_botao <- if (isTRUE(estado$modo_sequencia)) "btn_play_seq" else "btn_play"
+    updateActionButton(session, id_botao, label = if (isTRUE(estado$modo_sequencia)) "TOCAR" else " Tocar", icon = icon("play-circle"))
+    shinyjs::removeClass(id_botao, "btn-danger"); shinyjs::addClass(id_botao, "btn-primary")
+    shinyjs::enable("bpm"); shinyjs::enable("rep_levadas"); shinyjs::enable("instrumento"); 
+    shinyjs::enable("levadas_ativas"); shinyjs::enable("variada_opcoes"); shinyjs::enable("conv_ativas"); shinyjs::enable("acompanhamento_ativo")
+    shinyjs::enable("seq_bpm_control"); shinyjs::enable("seq_acompanhamento_ativo")
+  }
+  
+  get_duracao <- function(padrao, df_conv) {
+    if ("Duracao" %in% colnames(df_conv)) {
+      durs <- df_conv$Duracao[df_conv$Convencao == padrao]
+      durs <- durs[!is.na(durs) & trimws(as.character(durs)) != ""]
+      if (length(durs) > 0) return(as.numeric(sub(",", ".", trimws(as.character(durs[1])), fixed = TRUE)))
+    }
+    
+    c2_str <- NULL
+    if ("Compasso_2" %in% colnames(df_conv)) {
+      c2_str <- df_conv$Compasso_2[df_conv$Convencao == padrao][1]
+    } else if ("Compasso.2" %in% colnames(df_conv)) {
+      c2_str <- df_conv$Compasso.2[df_conv$Convencao == padrao][1]
+    } else if (ncol(df_conv) >= 4) {
+      c2_str <- df_conv[[4]][df_conv$Convencao == padrao][1]
+    }
+    
+    if (is.null(c2_str) || is.na(c2_str) || trimws(c2_str) == "" || grepl("^[\\s|-]*$", c2_str, perl=TRUE)) {
+      return(1)
+    } else {
+      return(2)
+    }
+  }
+  
+  # Duração de um passo de convenção: meio compasso (< 1) fica como está; senão desconta o "começar no compasso N"
+  dur_passo <- function(d, ini) if (d < 1) d else max(1, d - (ini - 1))
+  
+  # Nota forçada (Forca_Primeira_Nota) de uma convenção para o instrumento principal
+  forca_da_conv <- function(padrao) {
+    df_c <- df_convencoes[df_convencoes$Convencao == padrao & df_convencoes$Instrumento == instrumento_ativo(), ]
+    col <- if ("Forca_Primeira_Nota" %in% colnames(df_c)) "Forca_Primeira_Nota" else if ("Forca.Primeira.Nota" %in% colnames(df_c)) "Forca.Primeira.Nota" else NULL
+    if (!is.null(col) && nrow(df_c) > 0 && !is.na(df_c[[col]][1])) df_c[[col]][1] else ""
+  }
+  
+  # Instrumentos que tocam num passo da sequência: "*" = todos (passos antigos/sem lista)
+  inst_do_passo <- function(passo) {
+    x <- as.character(unlist(passo$instrumentos))
+    x <- x[!is.na(x) & nzchar(x)]
+    if (length(x) == 0) "*" else x
+  }
+  
+  # TRUE se a levada tem Pula_Entrada=Sim em qualquer linha do CSV (varre todas as linhas,
+  # pra não depender de qual instrumento tem a célula preenchida)
+  levada_pula_entrada <- function(padrao) {
+    col <- grep("^Pula", colnames(df_levadas), value = TRUE, ignore.case = TRUE)[1]
+    if (is.na(col)) return(FALSE)
+    vals <- df_levadas[[col]][df_levadas$Levada == padrao]
+    any(toupper(trimws(as.character(vals))) %in% c("SIM", "S", "TRUE", "1"), na.rm = TRUE)
+  }
+  
+  processar_compasso <- function(padrao, instrumento, fase, tocados, veio_conv, nota_forcada = "", pula_entrada = FALSE, desloc = 0) {
+    if (fase == "Levada") { df <- df_levadas[df_levadas$Levada == padrao & df_levadas$Instrumento == instrumento, ] }
+    else { df <- df_convencoes[df_convencoes$Convencao == padrao & df_convencoes$Instrumento == instrumento, ] }
+    if (nrow(df) == 0) return("-- -- -- -- | -- -- -- -- | -- -- -- -- | -- -- -- --")
+    
+    # 1. Busca dinamicamente TODAS as colunas que comecem com "Compasso"
+    cols_compasso <- grep("^Compasso", colnames(df), value = TRUE, ignore.case = TRUE)
+    cols_compasso <- sort(cols_compasso) # Garante a ordem correta 1, 2, 3, 4
+    
+    valores <- as.character(df[1, cols_compasso])
+    
+    # 2. Mantém apenas os compassos que foram preenchidos no CSV para esta linha
+    valores_validos <- valores[!is.na(valores) & trimws(valores) != ""]
+    
+    if (length(valores_validos) == 0) {
+      valores_validos <- c("-- -- -- -- | -- -- -- -- | -- -- -- -- | -- -- -- --")
+    }
+    
+    # Verifica loop estático no compasso 2
+    col_loop <- grep("^Loop", colnames(df), value = TRUE, ignore.case = TRUE)[1]
+    is_loop_c2 <- FALSE
+    if (fase == "Levada" && !is.na(col_loop)) {
+      val_loop <- df[[col_loop]][1]
+      if (!is.na(val_loop) && toupper(trimws(as.character(val_loop))) %in% c("SIM", "S", "TRUE", "1")) is_loop_c2 <- TRUE
+    }
+    
+    # Pula o compasso de entrada (compasso 1) quando a levada vem logo depois de outra
+    # levada/convenção (ver avancar_fase) e está marcada no CSV com Pula_Entrada=Sim
+    pular <- (fase == "Levada") && isTRUE(pula_entrada) && desloc == 0 && levada_pula_entrada(padrao)
+    tocados_idx <- (if (pular) tocados + 1 else tocados) + desloc
+    
+    # 3. Faz o looping matemático baseado na quantidade exata de compassos da levada
+    if (is_loop_c2 && length(valores_validos) >= 2) { 
+      idx <- if (tocados_idx == 0) 1 else 2 
+    } else { 
+      idx <- (tocados_idx %% length(valores_validos)) + 1 
+    }
+    
+    comp_str <- valores_validos[idx]
+    
+    if (fase == "Levada") { 
+      if (tocados == 0 && desloc == 0 && veio_conv && !pular) comp_str <- gsub("\\([^)]+\\)", "--", comp_str) 
+      else comp_str <- gsub("\\(|\\)", "", comp_str) 
+    } else { 
+      comp_str <- gsub("\\(|\\)", "", comp_str) 
+    }
+    
+    if (tocados == 0 && !is.null(nota_forcada) && !is.na(nota_forcada) && nota_forcada != "") {
+      comp_str <- sub("^\\S+", nota_forcada, trimws(comp_str))
+    }
+    
+    return(comp_str)
+  }
+  
+  avancar_fase <- function() {
+    fase_anterior <- estado$fase_atual; padrao_anterior <- estado$padrao_atual
+    
+    if (fase_anterior == "Convenção") {
+      df_c <- df_convencoes[df_convencoes$Convencao == estado$padrao_atual & df_convencoes$Instrumento == instrumento_ativo(), ]
+      col_forca <- if("Forca_Primeira_Nota" %in% colnames(df_c)) "Forca_Primeira_Nota" else if("Forca.Primeira.Nota" %in% colnames(df_c)) "Forca.Primeira.Nota" else NULL
+      estado$nota_forcada <- if(!is.null(col_forca) && nrow(df_c) > 0 && !is.na(df_c[[col_forca]][1])) df_c[[col_forca]][1] else ""
+    } else { 
+      estado$nota_forcada <- "" 
+    }
+    
+    estado$veio_de_convencao <- (fase_anterior == "Convenção")
+    # Levadas marcadas com Pula_Entrada=Sim no CSV (ex.: Swing 1/2/3, Alujá) pulam o
+    # compasso de entrada quando vêm logo depois de outra levada ou de uma convenção
+    # (exceto Pausa, que conta como silêncio). Início da sessão/Pausa: mantém a entrada.
+    estado$pula_entrada <- (fase_anterior == "Levada") || (fase_anterior == "Convenção" && !identical(padrao_anterior, "Pausa"))
+    estado$inst_atual <- estado$inst_proximo
+    estado$fase_atual <- estado$proxima_fase
+    estado$padrao_atual <- estado$proximo_padrao
+    estado$inicio_atual <- estado$inicio_proximo; estado$ov_atual <- estado$ov_proximo
+    if (!is.na(estado$bpm_proximo)) estado$bpm_efetivo <- estado$bpm_proximo   # BPM do passo vale dali em diante (até outro passo mudar)
+    
+    estado$compassos_restantes <- estado$proximos_compassos
+    estado$meio_desloc <- (fase_anterior == "Convenção") && (get_duracao(padrao_anterior, df_convencoes) < 1) && identical(estado$fase_atual, "Levada")
+    
+    estado$compassos_tocados <- 0
+    estado$proximo_padrao <- ""
+  }
+  
+  preencher_proximo <- function() {
+    if (estado$proximo_padrao == "") {
+      
+      if (isTRUE(estado$modo_sequencia)) {
+        idx <- estado$sequencia_indice
+        passos <- estado$sequencia_passos
+        if (idx > length(passos)) { estado$sequencia_fim <- TRUE; return() }
+        passo <- passos[[idx]]
+        estado$inst_proximo <- inst_do_passo(passo)
+        estado$sequencia_indice <- idx + 1
+        ini_n <- max(1, as.numeric(nz(passo$inicio, 1)))
+        estado$inicio_proximo <- ini_n
+        estado$ov_proximo <- if (is.null(passo$ov)) list() else passo$ov
+        estado$bpm_proximo <- suppressWarnings(as.numeric(nz(passo$bpm, NA)))
+        if (identical(passo$tipo, "levada")) {
+          estado$proxima_fase <- "Levada"
+          estado$proximo_padrao <- passo$padrao
+          estado$proximos_compassos <- as.numeric(passo$compassos)
+        } else {
+          estado$proxima_fase <- "Convenção"
+          estado$proximo_padrao <- passo$padrao
+          estado$proximos_compassos <- dur_passo(get_duracao(passo$padrao, df_convencoes), ini_n)
+        }
+        return()
+      }
+      
+      opcoes_l <- input$levadas_ativas; opcoes_c <- input$conv_ativas
+      tem_l <- length(opcoes_l) > 0; tem_c <- length(opcoes_c) > 0
+      if (tem_l && tem_c) { estado$proxima_fase <- ifelse(estado$fase_atual == "Levada", "Convenção", "Levada") } 
+      else if (tem_l) { estado$proxima_fase <- "Levada" } else if (tem_c) { estado$proxima_fase <- "Convenção" } else { return() }
+      
+      if (estado$proxima_fase == "Levada") {
+        opcoes_validas <- opcoes_l
+        if (length(opcoes_l) > 1 && estado$padrao_atual %in% opcoes_l) opcoes_validas <- setdiff(opcoes_l, estado$padrao_atual)
+        estado$proximo_padrao <- sample(opcoes_validas, 1)
+        opcoes_rep <- seq(input$rep_levadas[1], input$rep_levadas[2], by = 2)
+        estado$proximos_compassos <- if(length(opcoes_rep) == 1) opcoes_rep else sample(opcoes_rep, 1)
+      } else {
+        opcoes_validas <- opcoes_c
+        if (length(opcoes_c) > 1 && estado$padrao_atual %in% opcoes_c) opcoes_validas <- setdiff(opcoes_c, estado$padrao_atual)
+        estado$proximo_padrao <- sample(opcoes_validas, 1)
+        estado$proximos_compassos <- get_duracao(estado$proximo_padrao, df_convencoes)
+      }
+    }
+  }
+  
+  gerar_compasso_interno <- function() {
+    
+    if (estado$compassos_restantes <= 0) { avancar_fase(); preencher_proximo() }
+    nf <- if (estado$compassos_tocados == 0) estado$nota_forcada else ""
+    insts_tocar <- if (isTRUE(estado$modo_sequencia)) unique(c(instrumento_ativo(), input$seq_acompanhamento_ativo)) else unique(c(input$instrumento, input$acompanhamento_ativo))
+    strings_comp <- list(); str_variada <- "-- -- -- -- | -- -- -- -- | -- -- -- -- | -- -- -- --"
+    str_silencio <- "-- -- -- -- | -- -- -- -- | -- -- -- -- | -- -- -- --"
+    em_seq <- isTRUE(estado$modo_sequencia)
+    inst_passo <- if (em_seq) estado$inst_atual else "*"
+    fora <- character(0)
+    
+    # Contextos de passo: o atual e (na meia convenção) o próximo
+    ctx_atual <- list(fase = estado$fase_atual, padrao = estado$padrao_atual, inicio = estado$inicio_atual, ov = estado$ov_atual, inst = inst_passo, pula = estado$pula_entrada, veio = estado$veio_de_convencao)
+    ctx_prox <- list(fase = estado$proxima_fase, padrao = estado$proximo_padrao, inicio = estado$inicio_proximo, ov = estado$ov_proximo, inst = if (em_seq) estado$inst_proximo else "*", pula = !identical(estado$padrao_atual, "Pausa"), veio = TRUE)
+    n_t <- estado$compassos_tocados
+    # Meia convenção (Duracao < 1): 1ª metade do compasso = convenção; 2ª metade = começo da próxima levada,
+    # que segue deslocada meio compasso (estado$meio_desloc) até o fim do passo seguinte
+    meia_conv <- identical(estado$fase_atual, "Convenção") && estado$compassos_restantes > 0 && estado$compassos_restantes < 1
+    desloc_meio <- isTRUE(estado$meio_desloc) && identical(estado$fase_atual, "Levada")
+    nf_meia <- if (meia_conv) forca_da_conv(estado$padrao_atual) else ""
+    if (meia_conv && estado$proximo_padrao == "Variada" || estado$padrao_atual == "Variada" ) {
+      opcoes_sel <- input$variada_opcoes; if (is.null(opcoes_sel) || length(opcoes_sel) == 0) opcoes_sel <- c("Pausa")
+      padroes_sel <- dict_variada[opcoes_sel]; batidas_sorteadas <- sample(padroes_sel, 4, replace = TRUE)
+      if ("Pausa" %in% opcoes_sel && !(dict_variada[["Pausa"]] %in% batidas_sorteadas)) batidas_sorteadas[sample(1:4, 1)] <- dict_variada[["Pausa"]]
+      str_variada <- paste(batidas_sorteadas, collapse = " | ")
+    }
+    
+    pad4 <- function(x) { t <- trimws(strsplit(x, "\\|")[[1]]); if (length(t) < 4) t <- c(t, rep("-- -- -- --", 4 - length(t))); t }
+    
+    # Compasso de um instrumento para um contexto de passo (atual ou próximo). tocados_i = compassos já tocados do passo
+    calc_um <- function(inst, ctx, tocados_i, nf_i) {
+      if (!nzchar(ctx$padrao)) return(list(str = str_silencio, fora = TRUE, pad = ""))
+      # Sequência com lista de instrumentos por passo: quem não toca neste passo fica em silêncio
+      if (em_seq && !("*" %in% ctx$inst) && !(inst %in% ctx$inst)) return(list(str = str_silencio, fora = TRUE))
+      # Opções avançadas do passo: início em outro compasso, levada/convenção própria e entrada (compasso/tempo) por instrumento
+      fase_i <- ctx$fase; padrao_i <- ctx$padrao
+      desl <- if (em_seq) max(0, as.numeric(nz(ctx$inicio, 1)) - 1) else 0
+      ov_i <- if (em_seq) ctx$ov[[inst]] else NULL
+      ent_c <- 1; ent_b <- 1
+      if (!is.null(ov_i)) {
+        ent_c <- max(1, as.numeric(nz(ov_i$c, 1))); ent_b <- min(4, max(1, as.numeric(nz(ov_i$b, 1))))
+        if (tocados_i + 1 < ent_c) return(list(str = str_silencio, fora = TRUE))
+        pv <- nz(ov_i$p, "")
+        if (nzchar(pv)) { padrao_i <- pv; fase_i <- if (identical(ov_i$t, "C")) "Convenção" else "Levada" }
+      }
+      pode_tocar <- TRUE
+      if (inst != instrumento_ativo() && !em_seq) {
+        id_inst <- gsub(" ", "_", inst); ativas_l <- input[[paste0("acomp_lev_", id_inst)]]; ativas_c <- input[[paste0("acomp_conv_", id_inst)]]
+        pode_tocar <- (ctx$fase == "Levada" && (ctx$padrao %in% ativas_l)) || (ctx$fase == "Convenção" && (ctx$padrao %in% ativas_c))
+      }
+      if (!pode_tocar) {
+        comp_str <- str_silencio
+      } else if (padrao_i == "Variada") {
+        comp_str <- str_variada; if (tocados_i == 0 && nf_i != "") comp_str <- sub("^\\S+", nf_i, trimws(comp_str))
+      } else {
+        comp_str <- processar_compasso(padrao_i, inst, fase_i, tocados_i, ctx$veio, nf_i, ctx$pula, desl)
+      }
+      if (!is.null(ov_i) && tocados_i + 1 == ent_c && ent_b > 1) {
+        tempos_m <- strsplit(comp_str, "\\|")[[1]]
+        ate <- min(length(tempos_m), ent_b - 1)
+        tempos_m[seq_len(ate)] <- " -- -- -- -- "
+        comp_str <- paste(tempos_m, collapse = "|")
+      }
+      list(str = comp_str, fora = FALSE, pad = padrao_i)
+    }
+    
+    vol_comp <- list(); rev_comp <- list()
+    for (inst in insts_tocar) {
+      if (meia_conv) {
+        a <- calc_um(inst, ctx_atual, n_t, "")
+        b <- if (identical(estado$proxima_fase, "Levada")) calc_um(inst, ctx_prox, 0, nf_meia) else list(str = str_silencio, fora = TRUE)
+        comp_str <- paste(c(pad4(a$str)[1:2], pad4(b$str)[1:2]), collapse = " | ")
+        if (a$fora && b$fora) fora <- c(fora, inst)
+      } else if (desloc_meio) {
+        a <- calc_um(inst, ctx_atual, n_t, "")
+        b <- calc_um(inst, ctx_atual, n_t + 1, "")
+        comp_str <- paste(c(pad4(a$str)[3:4], pad4(b$str)[1:2]), collapse = " | ")
+        if (a$fora && b$fora) fora <- c(fora, inst)
+      } else {
+        a <- calc_um(inst, ctx_atual, n_t, nf)
+        comp_str <- a$str
+        if (a$fora) fora <- c(fora, inst)
+      }
+      
+      vt <- vol_tabela(nz(a$pad, ""), inst); if (!is.na(vt)) vol_comp[[inst]] <- vt
+      rv <- vol_tabela(nz(a$pad, ""), inst, "Reverb"); if (!is.na(rv)) rev_comp[[inst]] <- rv
+      
+      if (estado$compassos_restantes == 1 && tolower(estado$proximo_padrao) == "c2" && inst %in% c("Caixa", "Repique")) {
+        tempos <- strsplit(comp_str, "\\|")[[1]]
+        ultimo_tempo <- trimws(tempos[length(tempos)])
+        notas <- strsplit(ultimo_tempo, "\\s+")[[1]]
+        
+        if (length(notas) >= 4) {
+          notas[4] <- "co.co"
+        } else {
+          notas <- c("--", "--", "--", "co.co")
+        }
+        
+        tempos[length(tempos)] <- paste(notas, collapse = " ")
+        comp_str <- paste(tempos, collapse = " | ")
+      }
+      
+      if (estado$compassos_restantes == 1 && estado$padrao_atual == "Pausa" && tolower(estado$proximo_padrao) == "pagodão" && inst %in% c("Dobra", "Fundo 1", "Fundo 2")) {
+        tempos <- strsplit(comp_str, "\\|")[[1]]
+        if (length(tempos) >= 4) {
+          tempos[3] <- " -- -- le -- "
+          tempos[4] <- " pe -- le -- "
+          comp_str <- paste(tempos, collapse = "|")
+        }
+      }
+      strings_comp[[inst]] <- comp_str
+    }
+    if (estado$compassos_tocados == 0) estado$nota_forcada <- "" 
+    
+    ov_main <- if (em_seq) estado$ov_atual[[instrumento_ativo()]] else NULL
+    nome_exib <- estado$padrao_atual
+    if (!is.null(ov_main) && nzchar(nz(ov_main$p, ""))) nome_exib <- ov_main$p
+    img_atual <- if (nzchar(nome_exib)) map_imagens[[nome_exib]] else NULL; if(is.null(img_atual)) img_atual <- ""
+    img_prox <- if (nzchar(estado$proximo_padrao)) map_imagens[[estado$proximo_padrao]] else NULL; if(is.null(img_prox)) img_prox <- ""
+    
+    res <- list(html = strings_comp[[instrumento_ativo()]], strings = strings_comp, nome = nome_exib, 
+                img = img_atual, restantes = ceiling(estado$compassos_restantes), futuro = estado$proximo_padrao, futuro_img = img_prox,
+                fim_sequencia = FALSE, vol = vol_comp, rev = rev_comp, fora = as.list(fora), principal_fora = (instrumento_ativo() %in% fora))
+    if (isTRUE(estado$modo_sequencia) && !is.na(estado$bpm_efetivo)) res$bpm <- estado$bpm_efetivo
+    estado$compassos_restantes <- estado$compassos_restantes - 1; estado$compassos_tocados <- estado$compassos_tocados + 1
+    preencher_proximo()
+    if (isTRUE(estado$modo_sequencia) && isTRUE(estado$sequencia_fim) && estado$compassos_restantes <= 0) res$fim_sequencia <- TRUE
+    return(res)
+  }
+  
+  gerar_lote_compassos <- function(qtd) {
+    lote <- list()
+    for (i in seq_len(qtd)) {
+      if (isTRUE(estado$modo_sequencia) && isTRUE(estado$sequencia_fim) && estado$compassos_restantes <= 0) break
+      lote[[length(lote) + 1]] <- gerar_compasso_interno()
+    }
+    return(lote)
+  }
+  
+  executar_play_toggle <- function() {
+    id_botao <- if (isTRUE(estado$modo_sequencia)) "btn_play_seq" else "btn_play"
+    
+    if (!isTRUE(estado$modo_sequencia)) {
+      req(length(input$levadas_ativas) > 0 || length(input$conv_ativas) > 0)
+    } else {
+      req(length(estado$sequencia_passos) > 0)
+    }
+    estado$rodando <- !estado$rodando
+    
+    
+    if (estado$rodando) {
+      shinyjs::disable("bpm"); shinyjs::disable("rep_levadas"); shinyjs::disable("instrumento");
+      shinyjs::disable("levadas_ativas"); shinyjs::disable("variada_opcoes"); shinyjs::disable("conv_ativas"); shinyjs::disable("acompanhamento_ativo")
+      shinyjs::disable("seq_bpm_control"); shinyjs::disable("seq_acompanhamento_ativo")
+      
+      estado$veio_de_convencao <- TRUE; estado$pula_entrada <- FALSE; estado$nota_forcada <- ""
+      estado$inicio_atual <- 1; estado$inicio_proximo <- 1; estado$ov_atual <- list(); estado$ov_proximo <- list(); estado$meio_desloc <- FALSE; estado$bpm_efetivo <- NA_real_; estado$bpm_proximo <- NA_real_
+      
+      if (isTRUE(estado$modo_sequencia)) {
+        estado$sequencia_indice <- 1
+        estado$sequencia_fim <- FALSE
+        primeiro <- estado$sequencia_passos[[1]]
+        estado$inst_atual <- inst_do_passo(primeiro)
+        ini_p <- max(1, as.numeric(nz(primeiro$inicio, 1)))
+        estado$inicio_atual <- ini_p
+        estado$ov_atual <- if (is.null(primeiro$ov)) list() else primeiro$ov
+        estado$bpm_efetivo <- suppressWarnings(as.numeric(nz(primeiro$bpm, NA)))
+        estado$sequencia_indice <- 2
+        if (identical(primeiro$tipo, "levada")) {
+          estado$fase_atual <- "Levada"
+          estado$padrao_atual <- primeiro$padrao
+          estado$compassos_restantes <- as.numeric(primeiro$compassos)
+        } else {
+          estado$fase_atual <- "Convenção"
+          estado$padrao_atual <- primeiro$padrao
+          estado$compassos_restantes <- dur_passo(get_duracao(primeiro$padrao, df_convencoes), ini_p)
+        }
+      } else {
+        fases_possiveis <- c()
+        if (length(input$levadas_ativas) > 0) fases_possiveis <- c(fases_possiveis, "Levada")
+        if (length(input$conv_ativas) > 0) fases_possiveis <- c(fases_possiveis, "Convenção")
+        estado$fase_atual <- sample(fases_possiveis, 1)
+        
+        if (estado$fase_atual == "Levada") {
+          estado$padrao_atual <- sample(input$levadas_ativas, 1)
+          opcoes_rep <- seq(input$rep_levadas[1], input$rep_levadas[2], by = 2)
+          estado$compassos_restantes <- if(length(opcoes_rep) == 1) opcoes_rep else sample(opcoes_rep, 1)
+        } else {
+          estado$padrao_atual <- sample(input$conv_ativas, 1)
+          estado$compassos_restantes <- get_duracao(estado$padrao_atual, df_convencoes)
+        }
+        
+      }
+      estado$compassos_tocados <- 0
+      preencher_proximo()
+      
+      vol_map <- list()
+      if (!isTRUE(estado$modo_sequencia) && length(input$acompanhamento_ativo) > 0) {
+        for (inst in input$acompanhamento_ativo) {
+          id_inst <- gsub(" ", "_", inst)
+          val <- input[[paste0("vol_", id_inst)]]
+          vol_map[[inst]] <- if(is.null(val)) 0.75 else (val / 100.0)
+        }
+      } else if (isTRUE(estado$modo_sequencia) && length(input$seq_acompanhamento_ativo) > 0) {
+        for (inst in input$seq_acompanhamento_ativo) {
+          vol_map[[inst]] <- 0.75
+        }
+      }
+      
+      payload <- list(
+        bpm = as.numeric(bpm_ativo()), 
+        timbre = "Meus Sons (.wav)",
+        volPrincipal = if (isTRUE(estado$modo_sequencia)) 1.0 else input$vol_principal / 100.0,
+        volAcompMap = vol_map,
+        instPrincipal = instrumento_ativo(), 
+        isLoop = if (isTRUE(estado$modo_sequencia)) FALSE else (length(input$levadas_ativas) + length(input$conv_ativas)) == 1,
+        batch = gerar_lote_compassos(16)
+      )
+      session$sendCustomMessage("startPlayback", payload)
+      
+      updateActionButton(session, id_botao, label = " Pausar", icon = icon("pause-circle"))
+      shinyjs::removeClass(id_botao, "btn-primary"); shinyjs::addClass(id_botao, "btn-danger")
+    } else { reset_tudo() }
+  }
+  
+  observeEvent(input$btn_play, { executar_play_toggle() })
+  observeEvent(input$btn_play_seq, { executar_play_toggle() })
+  
+  observeEvent(input$js_request_batch, {
+    if (estado$rodando) {
+      session$sendCustomMessage("appendBatch", gerar_lote_compassos(8))
+    }
+  })
+
+  observeEvent(input$seq_inst_todos, {
+    updateCheckboxGroupInput(session, "seq_instrumentos_passo", selected = instrumentos_disponiveis)
+  })
+  observeEvent(input$seq_inst_nenhum, {
+    updateCheckboxGroupInput(session, "seq_instrumentos_passo", selected = character(0))
+  })
+  
+  observeEvent(input$btn_add_passo, {
+    sel_inst <- input$seq_instrumentos_passo
+    if (length(sel_inst) == 0) {
+      showNotification("Marque pelo menos um instrumento que toca neste passo (para silêncio total, use a convenção Pausa).", type = "warning")
+      return()
+    }
+    if (identical(input$seq_tipo_passo, "levada")) {
+      req(input$seq_padrao_levada)
+      novo <- list(tipo = "levada", padrao = input$seq_padrao_levada, compassos = as.numeric(input$seq_compassos_passo))
+    } else {
+      req(input$seq_padrao_convencao)
+      novo <- list(tipo = "convencao", padrao = input$seq_padrao_convencao)
+    }
+    # Opções avançadas: começar em outro compasso + levada/entrada por instrumento
+    ini <- suppressWarnings(as.integer(input$seq_inicio_compasso))
+    if (length(ini) == 0 || is.na(ini) || ini < 1) ini <- 1L
+    if (ini > 1) novo$inicio <- ini
+    ov <- list()
+    for (k in seq_along(instrumentos_disponiveis)) {
+      inst_k <- instrumentos_disponiveis[k]
+      if (!(inst_k %in% sel_inst)) next
+      v <- input[[paste0("seq_ov_", k)]]; if (is.null(v)) v <- ""
+      ec <- suppressWarnings(as.integer(input[[paste0("seq_oc_", k)]])); if (length(ec) == 0 || is.na(ec) || ec < 1) ec <- 1L
+      eb <- suppressWarnings(as.integer(input[[paste0("seq_ob_", k)]])); if (length(eb) == 0 || is.na(eb) || eb < 1) eb <- 1L
+      item <- list()
+      if (nzchar(v)) { item$t <- substr(v, 1, 1); item$p <- substring(v, 3) }
+      if (ec > 1) item$c <- ec
+      if (eb > 1) item$b <- eb
+      if (length(item) > 0) ov[[inst_k]] <- item
+    }
+    if (length(ov) > 0) novo$ov <- ov
+    bp <- suppressWarnings(as.numeric(input$seq_bpm_passo))
+    if (length(bp) == 1 && !is.na(bp) && bp >= 30) novo$bpm <- bp
+    updateNumericInput(session, "seq_bpm_passo", value = "")
+    updateNumericInput(session, "seq_inicio_compasso", value = 1)
+    for (k in seq_along(instrumentos_disponiveis)) {
+      updateSelectInput(session, paste0("seq_ov_", k), selected = "")
+      updateNumericInput(session, paste0("seq_oc_", k), value = 1)
+      updateSelectInput(session, paste0("seq_ob_", k), selected = "1")
+    }
+    # Só guarda a lista quando nem todos tocam (passos "com todos" ficam como antes, link mais curto)
+    if (length(sel_inst) < length(instrumentos_disponiveis)) novo$instrumentos <- as.character(sel_inst)
+    estado$passos_sequencia_editor[[length(estado$passos_sequencia_editor) + 1]] <- novo
+  })
+  
+  observeEvent(input$remover_passo_seq, {
+    i <- input$remover_passo_seq
+    passos <- estado$passos_sequencia_editor
+    if (i >= 1 && i <= length(passos)) {
+      estado$passos_sequencia_editor <- passos[-i]
+    }
+  })
+  
+  observeEvent(input$mover_passo_seq, {
+    info <- input$mover_passo_seq
+    i <- info$i; novo_i <- i + info$dir
+    passos <- estado$passos_sequencia_editor
+    if (novo_i >= 1 && novo_i <= length(passos)) {
+      tmp <- passos[[i]]; passos[[i]] <- passos[[novo_i]]; passos[[novo_i]] <- tmp
+      estado$passos_sequencia_editor <- passos
+    }
+  })
+  
+  output$lista_passos_sequencia <- renderUI({
+    passos <- estado$passos_sequencia_editor
+    if (length(passos) == 0) {
+      return(tags$p("Nenhum passo adicionado ainda.", style = "color:#bdc3c7; font-size:0.85em; text-align:center; margin: 10px 0;"))
+    }
+    
+    linhas <- lapply(seq_along(passos), function(i) {
+      p <- passos[[i]]
+      rotulo <- if (identical(p$tipo, "levada")) paste0(i, ". ", p$padrao, " (", p$compassos, " compassos)") else paste0(i, ". [Convenção] ", p$padrao)
+      if (!is.null(p$instrumentos)) rotulo <- paste0(rotulo, " — toca: ", paste(p$instrumentos, collapse = ", "))
+      if (!is.null(p$inicio)) rotulo <- paste0(rotulo, " — a partir do compasso ", p$inicio)
+      if (!is.null(p$bpm)) rotulo <- paste0(rotulo, " — ", p$bpm, " BPM")
+      if (length(p$ov) > 0) {
+        partes_ov <- vapply(names(p$ov), function(n) {
+          o <- p$ov[[n]]; txt <- n
+          if (!is.null(o$p)) txt <- paste0(txt, ": ", o$p)
+          if (!is.null(o$c) || !is.null(o$b)) txt <- paste0(txt, " (entra no compasso ", nz(o$c, 1), ", tempo ", nz(o$b, 1), ")")
+          txt
+        }, character(1))
+        rotulo <- paste0(rotulo, " — ", paste(partes_ov, collapse = "; "))
+      }
+      seta_cima <- if (i > 1) tags$a(icon("arrow-up"), href = "#", onclick = sprintf("Shiny.setInputValue('mover_passo_seq', {i: %d, dir: -1}, {priority:'event'}); return false;", i), style = "margin-right: 10px; color: #2F2F31;") else NULL
+      seta_baixo <- if (i < length(passos)) tags$a(icon("arrow-down"), href = "#", onclick = sprintf("Shiny.setInputValue('mover_passo_seq', {i: %d, dir: 1}, {priority:'event'}); return false;", i), style = "margin-right: 10px; color: #2F2F31;") else NULL
+      
+      div(style = "display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; margin-bottom: 4px; background: #f8f9fa; border-radius: 6px; font-size: 0.85em;",
+          tags$span(rotulo, style = "flex: 1;"),
+          tags$span(seta_cima, seta_baixo, tags$a(icon("trash"), href = "#", onclick = sprintf("Shiny.setInputValue('remover_passo_seq', %d, {priority:'event'}); return false;", i), style = "color: #e74c3c;"))
+      )
+    })
+    do.call(tagList, linhas)
+  })
+  
+  observeEvent(input$btn_gerar_link_seq, {
+    passos <- estado$passos_sequencia_editor
+    if (length(passos) == 0) { showNotification("Adicione pelo menos um passo antes de gerar o link.", type = "warning"); return() }
+    nome <- trimws(input$seq_nome)
+    if (nome == "") { showNotification("Digite um nome para o exercício.", type = "warning"); return() }
+    
+    seq_obj <- list(
+      nome = nome,
+      instrumento = input$seq_instrumento,
+      passos = passos
+    )
+    if (!identical(input$seq_bpm_modo, "livre")) seq_obj$bpm <- input$seq_bpm
+    if (identical(input$seq_bpm_modo, "fixa")) seq_obj$bpm_fixo <- TRUE
+    
+    session$sendCustomMessage("gerarLinkSequencia", seq_obj)
+  })
+  
+  observeEvent(input$link_sequencia_gerado, {
+    info <- input$link_sequencia_gerado
+    output$resultado_link_seq <- renderUI({
+      div(style = "margin-top: 12px;",
+          tags$label("Link do exercício (toque para copiar):", style = "font-weight: bold; font-size: 0.85em; display: block; margin-bottom: 4px;"),
+          tags$input(type = "text", value = info$url, readonly = "readonly", onclick = "this.select(); document.execCommand('copy');",
+                     style = "width: 100%; font-size: 0.72em; padding: 6px; margin-bottom: 10px; border: 1px solid #ddd; border-radius: 4px; background: #fff;"),
+          div(style = "display: flex; justify-content: center; margin-bottom: 10px;",
+              tags$a(icon("up-right-from-square"), " Abrir em nova aba", href = info$url, target = "_blank", rel = "noopener noreferrer",
+                     class = "btn btn-sm btn-outline-primary", style = "font-weight: bold;")
+          ),
+          div(style = "text-align: center;", tags$img(src = info$qr, style = "max-width: 180px; border-radius: 8px; border: 1px solid #eee;"))
+      )
+    })
+  })
+  
+  observeEvent(input$sequencia_da_url, {
+    seq <- input$sequencia_da_url
+    req(seq, seq$passos)
+    
+    estado$modo_sequencia <- TRUE
+    estado$sequencia_nome <- if (!is.null(seq$nome)) seq$nome else "Exercício"
+    estado$sequencia_passos <- seq$passos
+    estado$sequencia_indice <- 1
+    estado$sequencia_fim <- FALSE
+    
+    estado$sequencia_bpm <- if (!is.null(seq$bpm)) as.numeric(seq$bpm) else 80
+    estado$sequencia_instrumento <- if (!is.null(seq$instrumento)) seq$instrumento else "Dobra"
+    if (!is.null(seq$bpm)) updateSliderInput(session, "bpm", value = as.numeric(seq$bpm))
+    if (!is.null(seq$instrumento)) updateSelectInput(session, "instrumento", selected = seq$instrumento)
+    
+    updateSliderInput(session, "seq_bpm_control", value = estado$sequencia_bpm)
+    if (isTRUE(seq$bpm_fixo)) shinyjs::runjs("$('#seq_bpm_control').closest('.form-group').hide();")
+    updateCheckboxGroupInput(session, "seq_acompanhamento_ativo", choices = setdiff(instrumentos_disponiveis, estado$sequencia_instrumento), selected = character(0))
+    
+    shinyjs::hide("sidebar_principal")
+    shinyjs::runjs('$(".collapse-toggle").hide();')
+    shinyjs::hide("seletor_modo")
+    shinyjs::hide("cabecalho_livre")
+    shinyjs::show("cabecalho_sequencia")
+    shinyjs::html(id = "titulo_sequencia_ativa", html = estado$sequencia_nome)
+  })
+  
+  observeEvent(input$sequencia_terminou, {
+    estado$rodando <- FALSE
+    shinyjs::enable("bpm"); shinyjs::enable("rep_levadas"); shinyjs::enable("instrumento")
+    shinyjs::enable("levadas_ativas"); shinyjs::enable("variada_opcoes"); shinyjs::enable("conv_ativas"); shinyjs::enable("acompanhamento_ativo")
+    shinyjs::enable("seq_bpm_control"); shinyjs::enable("seq_acompanhamento_ativo")
+    if (isTRUE(estado$modo_sequencia)) {
+      updateActionButton(session, "btn_play_seq", label = "Tocar de novo", icon = icon("redo"))
+    } else {
+      updateActionButton(session, "btn_play", label = " Tocar", icon = icon("play-circle"))
+    }
+  })
+  
+  observeEvent(input$ir_modo_montar, {
+    if (isTRUE(estado$rodando)) reset_tudo()
+    shinyjs::hide("sidebar_principal")
+    shinyjs::runjs('$(".collapse-toggle").hide();')
+    shinyjs::hide("tela_ensaio_livre")
+    shinyjs::show("tela_montar_sequencia")
+    shinyjs::addClass("ir_modo_montar", "btn-modo-ativo")
+    shinyjs::removeClass("ir_modo_livre", "btn-modo-ativo")
+  })
+  
+  observeEvent(input$ir_modo_livre, {
+    if (isTRUE(estado$rodando)) reset_tudo()
+    shinyjs::show("sidebar_principal")
+    shinyjs::runjs('$(".collapse-toggle").show();')
+    shinyjs::show("tela_ensaio_livre")
+    shinyjs::hide("tela_montar_sequencia")
+    shinyjs::addClass("ir_modo_livre", "btn-modo-ativo")
+    shinyjs::removeClass("ir_modo_montar", "btn-modo-ativo")
+  })
+}
+
+shinyApp(ui = ui, server = server)

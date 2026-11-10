@@ -1,0 +1,9 @@
+.DS_Store
+.Rhistory
+.Rproj.user/
+_backup/
+_deploy_connect/deploy_out.txt
+_teste_local.log
+_porta7788.txt
+_cmd.sh
+_cmd.log
