@@ -33,7 +33,7 @@ limpar_nome_imagem <- function(texto) {
 # Para editar: abrir a planilha, alterar e recarregar a página do app.
 # ------------------------------------------------------------------------------
 PLANILHA_ID <- "1gHXIavK-15pUM8VUzYsyopSDydd5K4yt7WPDUfXOnFA"
-PLANILHA_ABAS <- c(levadas = "362173015", convencoes = "397132004", volumes = "79337583")
+PLANILHA_ABAS <- c(levadas = "362173015", convencoes = "397132004", volumes = "79337583", mostrar = "555001")
 fonte_dados <- c(levadas = "csv", convencoes = "csv", volumes = "csv")
 
 ler_aba_planilha <- function(aba, colunas_obrigatorias, min_linhas = 1) {
@@ -84,8 +84,18 @@ dict_variada <- c(
   "PeTeLe--" = "pe te le --", "Pe--LeCo" = "pe -- le co", "PeTe--Co" = "pe te -- co", "Pausa" = "-- -- -- --"
 )
 
-levadas_disponiveis <- unique(c(df_levadas$Levada, "Variada"))
-convencoes_disponiveis <- unique(df_convencoes$Convencao)
+# Aba "mostrar" da planilha (Tipo; Nome; Mostrar): caixinha desmarcada = levada/convenção fica fora das listas do app,
+# mas continua nos dados (links de sequência antigos que a usam seguem tocando). Quem não está na aba aparece normalmente.
+.nv <- ler_aba_planilha("mostrar", c("Tipo", "Nome", "Mostrar"), min_linhas = 0)
+if (!is.null(.nv)) {
+  .off <- toupper(trimws(.nv$Mostrar)) %in% c("FALSE", "FALSO", "F", "NAO", "NÃO", "N", "0")
+  .lev <- grepl("^l", trimws(.nv$Tipo), ignore.case = TRUE)
+  ocultas_levadas <- trimws(.nv$Nome[.off & .lev]); ocultas_convencoes <- trimws(.nv$Nome[.off & !.lev])
+} else if (!exists("ocultas_levadas")) { ocultas_levadas <- character(0); ocultas_convencoes <- character(0) }
+todas_levadas <- unique(c(df_levadas$Levada, "Variada"))
+todas_convencoes <- unique(df_convencoes$Convencao)
+levadas_disponiveis <- todas_levadas[!(trimws(todas_levadas) %in% ocultas_levadas)]
+convencoes_disponiveis <- todas_convencoes[!(trimws(todas_convencoes) %in% ocultas_convencoes)]
 instrumentos_disponiveis <- unique(c(df_levadas$Instrumento, df_convencoes$Instrumento))
 # Ordem dos instrumentos da Juventude Bronzeada (o que não estiver na lista vai para o fim)
 ordem_instrumentos <- c("Fundo 1", "Fundo 2", "Dobra", "Agogô", "Xequerê", "Caixa", "Repique", "Timbau")
@@ -97,11 +107,12 @@ nz <- function(x, d) if (is.null(x) || length(x) == 0 || is.na(x[1])) d else x
 .lev_ov <- setdiff(levadas_disponiveis, "Variada")
 choices_override <- list(
   "Mesma do passo" = "",
-  "Levadas" = setNames(paste0("L:", .lev_ov), .lev_ov),
-  "Convenções" = setNames(paste0("C:", convencoes_disponiveis), convencoes_disponiveis)
+  "Levadas" = setNames(paste0("L:", .lev_ov), .lev_ov)[seq_along(.lev_ov)],
+  "Convenções" = setNames(paste0("C:", convencoes_disponiveis), convencoes_disponiveis)[seq_along(convencoes_disponiveis)]
 )
+choices_override <- choices_override[c(TRUE, length(.lev_ov) > 0, length(convencoes_disponiveis) > 0)]
 
-todos_padroes <- unique(c(levadas_disponiveis, convencoes_disponiveis))
+todos_padroes <- unique(c(todas_levadas, todas_convencoes))
 # Acha o arquivo de imagem do sinal (tolera "Forró 1" -> forro1.png ou forro_1.png)
 # Variadas sem sinal de mão: usam a partitura (arquivo com nome diferente do padrão)
 imagens_alias <- c("Pe--LeCo" = "peleco", "PeTe--Co" = "peteco", "PeTeLe--" = "petele", "Pe----Co" = "pe_co", "PeTaLa" = "petala")
